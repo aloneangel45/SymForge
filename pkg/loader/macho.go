@@ -126,7 +126,10 @@ func loadMachO(path string, data []byte) (*LoadedBinary, error) {
 		}
 
 		prot := segProt[s.Seg]
-		exec := (prot&0x4) != 0 || (s.Flags&0x80000000) != 0 // VM_PROT_EXECUTE or S_ATTR_PURE_INSTRUCTIONS
+		// In Mach-O, __TEXT has VM_PROT_EXECUTE at the segment level even for read-only
+		// data sections like __TEXT.__cstring and __TEXT.__const. Only mark sections with
+		// instruction attributes (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) or __text as Executable.
+		exec := (s.Flags&(0x80000000|0x00000400)) != 0 || s.Name == "__text"
 		read := (prot&0x1) != 0 || fSize > 0
 		write := (prot & 0x2) != 0
 

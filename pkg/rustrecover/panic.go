@@ -72,16 +72,27 @@ func readRelocPtr(lb *loader.LoadedBinary, secData []byte, off int, slotVA uint6
 	}
 	if v != 0 && lb.SectionContainingVA(v) == nil &&
 		(lb.Info.Format == model.FormatMachO || lb.Info.Format == model.FormatMachOFat) &&
-		lb.Info.PointerSize == 8 && (v>>63) == 0 {
-		low36 := v & 0xfffffffff
-		candOffset := lb.Info.ImageBase + low36
-		if lb.SectionContainingVA(candOffset) != nil {
-			return candOffset
-		}
-		high8 := (v >> 36) & 0xff
-		candTarget := (high8 << 56) | low36
-		if lb.SectionContainingVA(candTarget) != nil {
-			return candTarget
+		lb.Info.PointerSize == 8 {
+		if (v >> 63) == 0 {
+			low36 := v & 0xfffffffff
+			if lb.SectionContainingVA(low36) != nil {
+				return low36
+			}
+			candOffset := lb.Info.ImageBase + low36
+			if lb.SectionContainingVA(candOffset) != nil {
+				return candOffset
+			}
+			high8 := (v >> 36) & 0xff
+			candTarget := (high8 << 56) | low36
+			if lb.SectionContainingVA(candTarget) != nil {
+				return candTarget
+			}
+		} else if (v >> 62) == 2 {
+			// arm64e authenticated rebase pointer (auth=1, bind=0): low 32 bits = offset from ImageBase
+			candPAC := lb.Info.ImageBase + (v & 0xffffffff)
+			if lb.SectionContainingVA(candPAC) != nil {
+				return candPAC
+			}
 		}
 	}
 	return v
@@ -364,12 +375,15 @@ func isIdentContByte(c byte) bool {
 
 func isIgnoredMetadataSection(name string) bool {
 	n := strings.ToLower(name)
+	if strings.Contains(n, "rel.ro") {
+		return false
+	}
 	for _, pfx := range []string{
 		".debug", "__dwarf", ".pdata", ".xdata", ".eh_frame",
-		".idata", ".reloc", ".symtab", ".strtab", ".rela", ".rel.",
+		".idata", ".reloc", ".symtab", ".strtab", ".rela", ".rel.", ".relr",
 		".gopclntab", "__gopclntab",
 	} {
-		if strings.HasPrefix(n, pfx) || strings.Contains(n, pfx) {
+		if strings.HasPrefix(n, pfx) {
 			return true
 		}
 	}
