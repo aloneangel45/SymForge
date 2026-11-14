@@ -184,20 +184,34 @@ func carvePanicLocations(lb *loader.LoadedBinary, relMap map[uint64]uint64) (pan
 				}
 
 				// --- Layout B1 (reordered repr(Rust)): [line: uint32, col: uint32, ptr: uintptr, len: uintptr] ---
-				lineB := lb.Order.Uint32(secData[off : off+4])
-				colB := lb.Order.Uint32(secData[off+4 : off+8])
-				ptrB := readRelocPtr(lb, secData, off+8, slotVA+8, relMap)
-				lenB := readPlainUintPtr(lb, secData, off+8+ptrSize)
-				if fileStr, ok := matchRustPathSlice(lb, ptrB, lenB, lineB, colB, rsByEndVA); ok {
-					emit(model.PanicLocation{
-						File:        fileStr,
-						Line:        lineB,
-						Column:      colB,
-						StructAddr:  slotVA,
-						FileStrAddr: ptrB,
-					})
-					off += layoutASize - 4
-					continue
+				// Guard against Mach-O 64-bit pointers (0x00000001_0000xxxx) immediately preceding a Layout A struct
+				// at off+8, whose low32/high32 words otherwise look like (line, col=1).
+				hasLayoutAAtPlus8 := false
+				if off+8+layoutASize <= len(secData) {
+					ptrNext := readRelocPtr(lb, secData, off+8, slotVA+8, relMap)
+					lenNext := readPlainUintPtr(lb, secData, off+8+ptrSize)
+					lineNext := lb.Order.Uint32(secData[off+8+2*ptrSize : off+8+2*ptrSize+4])
+					colNext := lb.Order.Uint32(secData[off+8+2*ptrSize+4 : off+8+2*ptrSize+8])
+					if _, okNext := matchRustPathSlice(lb, ptrNext, lenNext, lineNext, colNext, rsByEndVA); okNext {
+						hasLayoutAAtPlus8 = true
+					}
+				}
+				if !hasLayoutAAtPlus8 && lb.SectionContainingVA(readRelocPtr(lb, secData, off, slotVA, relMap)) == nil {
+					lineB := lb.Order.Uint32(secData[off : off+4])
+					colB := lb.Order.Uint32(secData[off+4 : off+8])
+					ptrB := readRelocPtr(lb, secData, off+8, slotVA+8, relMap)
+					lenB := readPlainUintPtr(lb, secData, off+8+ptrSize)
+					if fileStr, ok := matchRustPathSlice(lb, ptrB, lenB, lineB, colB, rsByEndVA); ok {
+						emit(model.PanicLocation{
+							File:        fileStr,
+							Line:        lineB,
+							Column:      colB,
+							StructAddr:  slotVA,
+							FileStrAddr: ptrB,
+						})
+						off += layoutASize - 4
+						continue
+					}
 				}
 			}
 
