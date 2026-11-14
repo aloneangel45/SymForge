@@ -286,6 +286,14 @@ func TestSyntheticAuditablePanicAndVTableRecovery(t *testing.T) {
 	putU64(8)
 	putU64(textVA + 0x20)
 
+	// VTable #3 (Rust 1.77+ Option<fn>::None drop_in_place == 0, size=32, align=1, 2 methods)
+	vt3VA := uint64(rodataVA + rodata.Len())
+	putU64(0) // None drop_in_place
+	putU64(32)
+	putU64(1)
+	putU64(textVA + 0x20)
+	putU64(textVA + 0x40)
+
 	elfImage := buildSyntheticELF64(textVA, textBytes, rodataVA, rodata.Bytes(), depVA, depV0Bytes)
 	lb, err := loader.LoadBytes("synthetic_rust.elf", elfImage)
 	if err != nil {
@@ -340,15 +348,18 @@ func TestSyntheticAuditablePanicAndVTableRecovery(t *testing.T) {
 		t.Fatalf("expected both PanicLocations carved (foundLoc1=%v, foundLoc2=%v), got: %+v", foundLoc1, foundLoc2, res.Panics)
 	}
 
-	// Verify both adjacent VTables were cleanly split and recovered
-	if len(res.Types) != 2 {
-		t.Fatalf("expected 2 vtables, got %d: %+v", len(res.Types), res.Types)
+	// Verify all 3 adjacent VTables (including Rust 1.77+ None drop_in_place == 0) were cleanly split and recovered
+	if len(res.Types) != 3 {
+		t.Fatalf("expected 3 vtables, got %d: %+v", len(res.Types), res.Types)
 	}
 	if res.Types[0].Addr != vt1VA || res.Types[0].Size != 32 || res.Types[0].Align != 8 || len(res.Types[0].Methods) != 2 {
 		t.Fatalf("unexpected vtable[0]: %+v", res.Types[0])
 	}
 	if res.Types[1].Addr != vt2VA || res.Types[1].Size != 16 || res.Types[1].Align != 8 || len(res.Types[1].Methods) != 1 {
 		t.Fatalf("unexpected vtable[1]: %+v", res.Types[1])
+	}
+	if res.Types[2].Addr != vt3VA || res.Types[2].Size != 32 || res.Types[2].Align != 1 || len(res.Types[2].Methods) != 2 {
+		t.Fatalf("unexpected None-drop vtable[2]: %+v", res.Types[2])
 	}
 }
 
@@ -504,6 +515,16 @@ func TestRealRustcIntegrationUnstrippedAndStripped(t *testing.T) {
 
 	if len(resSt.Types) == 0 {
 		t.Errorf("expected recovered vtables on stripped binary, got 0")
+	}
+	sawHmacVTable := false
+	for _, vt := range resSt.Types {
+		if vt.Size == 32 && vt.Align == 1 && len(vt.Methods) == 2 {
+			sawHmacVTable = true
+			break
+		}
+	}
+	if !sawHmacVTable {
+		t.Errorf("expected stripped binary to recover None-drop HmacVerifier vtable (size=32, align=1, methods=2), got types=%+v", resSt.Types)
 	}
 
 	// On x86_64 Windows PE, verify .pdata synthesized sub_<hex> and entry functions

@@ -112,6 +112,11 @@ func ExportCycloneDX(res *model.AnalysisResult) ([]byte, error) {
 		components = append(components, comp)
 	}
 
+	var appVersion string
+	if res.Go != nil && res.Go.ModuleVersion != "" && res.Go.ModuleVersion != "(devel)" {
+		appVersion = res.Go.ModuleVersion
+	}
+
 	bom := cdxBOM{
 		BOMFormat:   "CycloneDX",
 		SpecVersion: "1.5",
@@ -121,11 +126,12 @@ func ExportCycloneDX(res *model.AnalysisResult) ([]byte, error) {
 		Metadata: cdxMetadata{
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Tools: []cdxTool{
-				{Vendor: "SymForge", Name: "symforge", Version: "1.0.0"},
+				{Vendor: "SymForge", Name: "symforge", Version: "1.0.1"},
 			},
 			Component: cdxComponent{
 				Type:       "application",
 				Name:       appName,
+				Version:    appVersion,
 				Hashes:     hashes,
 				Properties: rootProps,
 			},
@@ -139,7 +145,7 @@ func ExportCycloneDX(res *model.AnalysisResult) ([]byte, error) {
 func buildPURL(dep model.Dependency) string {
 	ver := strings.TrimPrefix(dep.Version, "v")
 	switch strings.ToLower(dep.Ecosystem) {
-	case "go", "golang":
+	case "go", "golang", "gomod":
 		if dep.Version != "" {
 			return fmt.Sprintf("pkg:golang/%s@%s", dep.Name, dep.Version)
 		}

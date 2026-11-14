@@ -244,7 +244,7 @@ func (a *analyzer) recordDataRef(callerIdx int, insnVA uint64, targetVA uint64) 
 			if raw, sec, ok := a.strExt.sliceAtVA(targetVA, ptrSize*2); ok && sec.readOnly && len(raw) >= ptrSize*2 {
 				var indPtr, indLen uint64
 				if ptrSize == 8 {
-					indPtr = a.lb.Order.Uint64(raw[:8])
+					indPtr = a.lb.NormalizePointer(a.lb.Order.Uint64(raw[:8]))
 					indLen = a.lb.Order.Uint64(raw[8:16])
 				} else {
 					indPtr = uint64(a.lb.Order.Uint32(raw[:4]))

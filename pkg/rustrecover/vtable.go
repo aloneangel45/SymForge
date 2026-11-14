@@ -44,9 +44,10 @@ func scanRustVTables(
 		}
 
 		off := 0
+		allowNullDrop := isExplicitRelocConstSection(s, lb)
 		for off+minHeaderBytes <= len(secData) && len(vtables) < maxVTables {
 			vtableVA := s.VirtualAddr + uint64(off)
-			dropPtr, size, align, m0, valid := checkVTableHeaderAt(lb, secData, off, vtableVA, ptrSize, relMap)
+			dropPtr, size, align, m0, valid := checkVTableHeaderAt(lb, secData, off, vtableVA, ptrSize, relMap, allowNullDrop)
 			if !valid {
 				off += ptrSize
 				continue
@@ -59,12 +60,12 @@ func scanRustVTables(
 				slotVA := s.VirtualAddr + uint64(curOff)
 				// If curOff itself begins a distinct valid vtable header, stop before swallowing next vtable's drop_in_place
 				if curOff+minHeaderBytes <= len(secData) {
-					if _, _, _, _, nextValid := checkVTableHeaderAt(lb, secData, curOff, slotVA, ptrSize, relMap); nextValid {
+					if _, _, _, _, nextValid := checkVTableHeaderAt(lb, secData, curOff, slotVA, ptrSize, relMap, allowNullDrop); nextValid {
 						break
 					}
 				}
 				mPtr := readRelocPtr(lb, secData, curOff, slotVA, relMap)
-				if !lb.IsCodeVA(mPtr) {
+				if !isPlausibleCodeEntry(lb, mPtr) {
 					break
 				}
 				methods = append(methods, resolveMethodLabel(mPtr, funcNames))
@@ -96,15 +97,25 @@ func checkVTableHeaderAt(
 	slotVA uint64,
 	ptrSize int,
 	relMap map[uint64]uint64,
+	allowNullDrop bool,
 ) (dropPtr, size, align, method0 uint64, ok bool) {
 	dropPtr = readRelocPtr(lb, secData, off, slotVA, relMap)
-	if !lb.IsCodeVA(dropPtr) {
+	if dropPtr == 0 {
+		// Rust 1.77+ encodes Option<unsafe fn(*mut ())>::None as 0 when concrete type has no Drop glue.
+		if !allowNullDrop {
+			return 0, 0, 0, 0, false
+		}
+	} else if !isPlausibleCodeEntry(lb, dropPtr) {
 		return 0, 0, 0, 0, false
 	}
 
 	size = readPlainUintPtr(lb, secData, off+ptrSize)
 	align = readPlainUintPtr(lb, secData, off+2*ptrSize)
-	if size > maxVTableObjectSize || lb.IsCodeVA(size) || !isValidVTableAlign(align) || lb.IsCodeVA(align) {
+	maxSz := uint64(maxVTableObjectSize)
+	if dropPtr == 0 {
+		maxSz = 65536
+	}
+	if size > maxSz || lb.IsCodeVA(size) || !isValidVTableAlign(align) || lb.IsCodeVA(align) {
 		return 0, 0, 0, 0, false
 	}
 	if size%align != 0 {
@@ -112,10 +123,37 @@ func checkVTableHeaderAt(
 	}
 
 	method0 = readRelocPtr(lb, secData, off+3*ptrSize, slotVA+uint64(3*ptrSize), relMap)
-	if !lb.IsCodeVA(method0) {
+	if !isPlausibleCodeEntry(lb, method0) {
 		return 0, 0, 0, 0, false
 	}
 	return dropPtr, size, align, method0, true
+}
+
+func isPlausibleCodeEntry(lb *loader.LoadedBinary, va uint64) bool {
+	if va == 0 || !lb.IsCodeVA(va) {
+		return false
+	}
+	if lb.Info.Arch == model.ArchARM64 && (va&3) != 0 {
+		return false
+	}
+	// Reject pointers into INT3 (0xCC) or zero-fill padding between functions on x86/x86_64.
+	if code, ok := lb.ReadAtVA(va, 2); ok && len(code) == 2 {
+		if (code[0] == 0x00 && code[1] == 0x00) || code[0] == 0xcc {
+			return false
+		}
+	}
+	return true
+}
+
+func isExplicitRelocConstSection(s *model.SectionInfo, lb *loader.LoadedBinary) bool {
+	lower := strings.ToLower(s.Name)
+	if strings.Contains(lower, "rel.ro") || lower == "__data_const.__const" || lower == "__data.__const" || lower == ".rdata" {
+		return true
+	}
+	if !lb.Info.PIE && (lower == ".rodata" || strings.HasPrefix(lower, ".rodata.") || lower == "__text.__const") {
+		return true
+	}
+	return false
 }
 
 func isValidVTableAlign(a uint64) bool {

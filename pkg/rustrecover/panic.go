@@ -22,36 +22,63 @@ type rsSliceSpan struct {
 	path string
 }
 
-// buildELFRelativeMap parses .rela.dyn / .rela.data.rel.ro (if present on 64-bit ELF PIE binaries)
+// buildELFRelativeMap parses .rela* and 32-bit .rel* sections on ELF PIE binaries
 // so pointers stored as 0 in .data.rel.ro with RELA r_addend still resolve to exact virtual addresses.
 func buildELFRelativeMap(lb *loader.LoadedBinary) map[uint64]uint64 {
-	if lb.Info.Format != model.FormatELF || lb.Info.PointerSize != 8 {
+	if lb.Info.Format != model.FormatELF {
 		return nil
 	}
 	const (
 		rX86_64Relative  = 8
 		rAArch64Relative = 1027
+		r386Relative     = 8
+		rARMRelative     = 23
 	)
 	var out map[uint64]uint64
-	for i := range lb.Sections {
-		s := &lb.Sections[i]
-		if !strings.HasPrefix(s.Name, ".rela") || strings.HasPrefix(s.Name, ".rela.plt") {
-			continue
-		}
-		data, ok := lb.SectionBytes(s)
-		if !ok || len(data) < 24 {
-			continue
-		}
-		for off := 0; off+24 <= len(data); off += 24 {
-			rOffset := lb.Order.Uint64(data[off : off+8])
-			rInfo := lb.Order.Uint64(data[off+8 : off+16])
-			rAddend := lb.Order.Uint64(data[off+16 : off+24])
-			rType := uint32(rInfo & 0xffffffff)
-			if (rType == rX86_64Relative || rType == rAArch64Relative) && rOffset != 0 && rAddend != 0 {
-				if out == nil {
-					out = make(map[uint64]uint64, len(data)/24)
+	if lb.Info.PointerSize == 8 {
+		for i := range lb.Sections {
+			s := &lb.Sections[i]
+			if !strings.HasPrefix(s.Name, ".rela") || strings.HasPrefix(s.Name, ".rela.plt") {
+				continue
+			}
+			data, ok := lb.SectionBytes(s)
+			if !ok || len(data) < 24 {
+				continue
+			}
+			for off := 0; off+24 <= len(data); off += 24 {
+				rOffset := lb.Order.Uint64(data[off : off+8])
+				rInfo := lb.Order.Uint64(data[off+8 : off+16])
+				rAddend := lb.Order.Uint64(data[off+16 : off+24])
+				rType := uint32(rInfo & 0xffffffff)
+				if (rType == rX86_64Relative || rType == rAArch64Relative) && rOffset != 0 && rAddend != 0 {
+					if out == nil {
+						out = make(map[uint64]uint64, len(data)/24)
+					}
+					out[rOffset] = rAddend
 				}
-				out[rOffset] = rAddend
+			}
+		}
+	} else if lb.Info.PointerSize == 4 {
+		for i := range lb.Sections {
+			s := &lb.Sections[i]
+			if !strings.HasPrefix(s.Name, ".rela") || strings.HasPrefix(s.Name, ".rela.plt") {
+				continue
+			}
+			data, ok := lb.SectionBytes(s)
+			if !ok || len(data) < 12 {
+				continue
+			}
+			for off := 0; off+12 <= len(data); off += 12 {
+				rOffset := uint64(lb.Order.Uint32(data[off : off+4]))
+				rInfo := lb.Order.Uint32(data[off+4 : off+8])
+				rAddend := uint64(lb.Order.Uint32(data[off+8 : off+12]))
+				rType := rInfo & 0xff
+				if (rType == r386Relative || rType == rARMRelative) && rOffset != 0 && rAddend != 0 {
+					if out == nil {
+						out = make(map[uint64]uint64, len(data)/12)
+					}
+					out[rOffset] = rAddend
+				}
 			}
 		}
 	}
@@ -70,32 +97,7 @@ func readRelocPtr(lb *loader.LoadedBinary, secData []byte, off int, slotVA uint6
 			return target
 		}
 	}
-	if v != 0 && lb.SectionContainingVA(v) == nil &&
-		(lb.Info.Format == model.FormatMachO || lb.Info.Format == model.FormatMachOFat) &&
-		lb.Info.PointerSize == 8 {
-		if (v >> 63) == 0 {
-			low36 := v & 0xfffffffff
-			if lb.SectionContainingVA(low36) != nil {
-				return low36
-			}
-			candOffset := lb.Info.ImageBase + low36
-			if lb.SectionContainingVA(candOffset) != nil {
-				return candOffset
-			}
-			high8 := (v >> 36) & 0xff
-			candTarget := (high8 << 56) | low36
-			if lb.SectionContainingVA(candTarget) != nil {
-				return candTarget
-			}
-		} else if (v >> 62) == 2 {
-			// arm64e authenticated rebase pointer (auth=1, bind=0): low 32 bits = offset from ImageBase
-			candPAC := lb.Info.ImageBase + (v & 0xffffffff)
-			if lb.SectionContainingVA(candPAC) != nil {
-				return candPAC
-			}
-		}
-	}
-	return v
+	return lb.NormalizePointer(v)
 }
 
 // carvePanicLocations locates .rs source path slices and carves binary core::panic::Location structs.

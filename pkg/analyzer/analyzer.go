@@ -49,9 +49,16 @@ type cacheKey struct {
 
 type cacheEntry struct {
 	key    cacheKey
+	lb     *loader.LoadedBinary
 	result *model.AnalysisResult
 	symMap map[uint64]string
 	strMap map[uint64]string
+}
+
+type inflightAnalysis struct {
+	done  chan struct{}
+	entry *cacheEntry
+	err   error
 }
 
 // Engine manages cached binary analysis across CLI and MCP invocations.
@@ -59,6 +66,7 @@ type Engine struct {
 	mu         sync.Mutex
 	maxEntries int
 	entries    []cacheEntry
+	inflight   map[cacheKey]*inflightAnalysis
 }
 
 // NewEngine creates an Engine with bounded in-memory result caching.
@@ -69,6 +77,7 @@ func NewEngine(maxEntries int) *Engine {
 	return &Engine{
 		maxEntries: maxEntries,
 		entries:    make([]cacheEntry, 0, maxEntries),
+		inflight:   make(map[cacheKey]*inflightAnalysis),
 	}
 }
 
@@ -103,11 +112,11 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 		mtimeNano: st.ModTime().UnixNano(),
 	}
 
+	var flight *inflightAnalysis
 	if !opts.BypassCache {
 		e.mu.Lock()
 		for i, item := range e.entries {
 			if item.key == ck {
-				// Move to front (MRU)
 				if i > 0 {
 					copy(e.entries[1:i+1], e.entries[0:i])
 					e.entries[0] = item
@@ -116,22 +125,45 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 				return &item, nil
 			}
 		}
+		if existingFlight, waiting := e.inflight[ck]; waiting {
+			e.mu.Unlock()
+			<-existingFlight.done
+			return existingFlight.entry, existingFlight.err
+		}
+		if e.inflight == nil {
+			e.inflight = make(map[cacheKey]*inflightAnalysis)
+		}
+		flight = &inflightAnalysis{done: make(chan struct{})}
+		e.inflight[ck] = flight
 		e.mu.Unlock()
+	}
+
+	finishFlight := func(entry *cacheEntry, ferr error) (*cacheEntry, error) {
+		if flight != nil {
+			e.mu.Lock()
+			flight.entry = entry
+			flight.err = ferr
+			delete(e.inflight, ck)
+			close(flight.done)
+			e.mu.Unlock()
+		}
+		return entry, ferr
 	}
 
 	start := time.Now()
 	lb, err := loader.LoadFile(absPath)
 	if err != nil {
-		return nil, err
+		return finishFlight(nil, err)
 	}
 
 	res, symMap, strMap, err := AnalyzeLoaded(lb, opts, start)
 	if err != nil {
-		return nil, err
+		return finishFlight(nil, err)
 	}
 
 	ce := cacheEntry{
 		key:    ck,
+		lb:     lb,
 		result: res,
 		symMap: symMap,
 		strMap: strMap,
@@ -153,7 +185,7 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 	e.entries = filtered
 	e.mu.Unlock()
 
-	return &ce, nil
+	return finishFlight(&ce, nil)
 }
 
 // AnalyzeBytes runs full SymForge analysis on raw in-memory binary bytes.
@@ -306,9 +338,13 @@ func (e *Engine) InspectFunction(path, target string, disassemble bool, maxInsns
 	}
 
 	if disassemble {
-		lb, err := loader.LoadFile(ce.key.absPath)
-		if err != nil {
-			return nil, err
+		lb := ce.lb
+		if lb == nil {
+			var err error
+			lb, err = loader.LoadFile(ce.key.absPath)
+			if err != nil {
+				return nil, err
+			}
 		}
 		insns, err := xref.DisassembleFunction(lb, *fn, ce.symMap, ce.strMap, maxInsns)
 		if err != nil {

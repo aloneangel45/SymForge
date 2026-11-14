@@ -16,11 +16,15 @@ func ExportGhidra(res *model.AnalysisResult, opts Options) []byte {
 	fmt.Fprintf(&buf, "# SymForge Ghidra Symbol, Type & XREF Recovery Script\n")
 	fmt.Fprintf(&buf, "# Target SHA-256: %s\n", res.Binary.SHA256)
 	fmt.Fprintf(&buf, "# Format: %s | Arch: %s | Language: %s\n", res.Binary.Format, res.Binary.Arch, res.Binary.Language)
-	fmt.Fprintf(&buf, "# @category SymForge\n")
-	fmt.Fprintf(&buf, "# @runtime Jython\n\n")
+	fmt.Fprintf(&buf, "# @category SymForge\n\n")
 
 	buf.WriteString(`from ghidra.program.model.symbol import SourceType
 from ghidra.program.model.listing import CodeUnit
+
+try:
+    println
+except NameError:
+    println = print
 
 ORIG_IMAGE_BASE = `)
 	fmt.Fprintf(&buf, "0x%x\n", res.Binary.ImageBase)

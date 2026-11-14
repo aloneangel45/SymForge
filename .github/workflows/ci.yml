@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -27,8 +30,16 @@ jobs:
           go-version: '1.27.x'
           cache: true
 
-      - name: Setup Rust Toolchain (for stripped Rust binary integration tests)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Ensure Rust Toolchain (preinstalled or resilient fallback)
+        shell: bash
+        run: |
+          if command -v rustc >/dev/null 2>&1; then
+            rustc --version
+          else
+            curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-all-errors https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            "$HOME/.cargo/bin/rustc" --version
+          fi
 
       - name: Verify pure-Go static analysis (go vet)
         env:

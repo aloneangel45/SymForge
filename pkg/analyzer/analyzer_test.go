@@ -96,3 +96,45 @@ func TestEngineAnalyzeAndInspectStrippedGo(t *testing.T) {
 		t.Fatalf("expected decoded x86_64 instructions for VerifyEndpoint")
 	}
 }
+
+func TestConcurrentColdCacheDeduplicationAndInMemoryDisasm(t *testing.T) {
+	origPath := buildStrippedGoSample(t, "linux", "amd64")
+	// Copy to a disposable path so we can test in-memory disassembly even if we don't touch disk again
+	tmpCopy := filepath.Join(t.TempDir(), "vaultprobe_copy")
+	raw, err := os.ReadFile(origPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmpCopy, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := NewEngine(4)
+	const workers = 8
+	results := make([]*model.AnalysisResult, workers)
+	errs := make([]error, workers)
+
+	done := make(chan int, workers)
+	for i := 0; i < workers; i++ {
+		go func(idx int) {
+			results[idx], errs[idx] = eng.AnalyzeFile(tmpCopy, Options{})
+			done <- idx
+		}(i)
+	}
+	for i := 0; i < workers; i++ {
+		<-done
+	}
+	for i := 0; i < workers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("worker %d failed: %v", i, errs[i])
+		}
+		if results[i] != results[0] {
+			t.Fatalf("expected concurrent cold-cache callers to share deduplicated *AnalysisResult pointer")
+		}
+	}
+
+	insp, err := eng.InspectFunction(tmpCopy, "VerifyEndpoint", true, 64)
+	if err != nil || len(insp.Instructions) == 0 {
+		t.Fatalf("InspectFunction from cached LoadedBinary failed: err=%v insns=%d", err, len(insp.Instructions))
+	}
+}

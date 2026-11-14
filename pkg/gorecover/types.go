@@ -356,6 +356,44 @@ func enqueueChildTypes(
 				}
 			}
 		}
+	case abiKindStruct:
+		// Traverse anonymous struct fields so named types nested inside unnamed structs are discovered.
+		if (hdr.tflag & tflagNamed) == 0 {
+			if extBuf, ok := lb.ReadAtVA(hdr.va+baseSz, 4*ps); ok {
+				slicePtr := normalizePointer(lb, readUintPtr(extBuf[ps:], ps, bo))
+				sliceLen := readUintPtr(extBuf[2*ps:], ps, bo)
+				sliceCap := readUintPtr(extBuf[3*ps:], ps, bo)
+				if slicePtr != 0 && sliceLen > 0 && sliceLen <= sliceCap && sliceLen <= 128 {
+					fieldStride := 3 * ps
+					if fieldsRaw, ok := lb.ReadAtVA(slicePtr, int(sliceLen)*fieldStride); ok {
+						for i := 0; i < int(sliceLen); i++ {
+							fTypVA := normalizePointer(lb, readUintPtr(fieldsRaw[i*fieldStride+ps:], ps, bo))
+							if fTypVA != 0 {
+								enqueue(fTypVA)
+							}
+						}
+					}
+				}
+			}
+		}
+	case abiKindInterface:
+		if (hdr.tflag & tflagNamed) == 0 {
+			if extBuf, ok := lb.ReadAtVA(hdr.va+baseSz, 4*ps); ok {
+				slicePtr := normalizePointer(lb, readUintPtr(extBuf[ps:], ps, bo))
+				sliceLen := readUintPtr(extBuf[2*ps:], ps, bo)
+				sliceCap := readUintPtr(extBuf[3*ps:], ps, bo)
+				if slicePtr != 0 && sliceLen > 0 && sliceLen <= sliceCap && sliceLen <= 128 {
+					if methodsRaw, ok := lb.ReadAtVA(slicePtr, int(sliceLen)*8); ok {
+						for i := 0; i < int(sliceLen); i++ {
+							mTypOff := int32(bo.Uint32(methodsRaw[i*8+4 : i*8+8]))
+							if mTypOff > 0 {
+								enqueue(md.types + uint64(mTypOff))
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -575,12 +613,12 @@ func resolveTypeString(lb *loader.LoadedBinary, md *parsedModuleData, hdr rawABI
 	return s, s != ""
 }
 
-// decodeABINameAtVA decodes an internal/abi.Name encoded at virtual address va.
+// decodeABINameAtVA decodes an internal/abi.Name (Go 1.17+ varint length or Go <=1.16 uint16 BE length) at va.
 func decodeABINameAtVA(lb *loader.LoadedBinary, va uint64) (name, tag string, embedded, ok bool) {
 	if va == 0 {
 		return "", "", false, false
 	}
-	// Read initial header + varint window.
+	// Read initial header + length window.
 	head, ok := lb.ReadAtVA(va, 16)
 	if !ok || len(head) < 2 {
 		return "", "", false, false
@@ -593,9 +631,25 @@ func decodeABINameAtVA(lb *loader.LoadedBinary, va uint64) (name, tag string, em
 	hasTag := (bits & (1 << 1)) != 0
 	embedded = (bits & (1 << 3)) != 0
 
-	nameLen, nBytes, ok := readABINameVarint(head[1:])
-	if !ok || nameLen < 0 || nameLen > 4096 {
-		return "", "", false, false
+	// Go <= 1.16 encoded name length as big-endian uint16 [head[1], head[2]] (so names < 256 bytes have head[1] == 0, head[2] > 0).
+	// Go 1.17+ uses base-128 varint (where head[1] == 0 exclusively represents an empty 0-length name).
+	useLegacyUint16 := false
+	if len(head) >= 3 && head[1] == 0 && head[2] > 0 && head[2] <= 127 {
+		candLen := int(head[2])
+		if nb, ok := lb.ReadAtVA(va+3, candLen); ok && utf8.Valid(nb) && isAllPrintableIdent(nb) {
+			useLegacyUint16 = true
+		}
+	}
+
+	var nameLen, nBytes int
+	if useLegacyUint16 {
+		nameLen = int(head[1])<<8 | int(head[2])
+		nBytes = 2
+	} else {
+		nameLen, nBytes, ok = readABINameVarint(head[1:])
+		if !ok || nameLen < 0 || nameLen > 4096 {
+			return "", "", false, false
+		}
 	}
 
 	nameStartVA := va + 1 + uint64(nBytes)
@@ -614,8 +668,16 @@ func decodeABINameAtVA(lb *loader.LoadedBinary, va uint64) (name, tag string, em
 		tagHdrVA := nameStartVA + uint64(nameLen)
 		tagHead, ok := lb.ReadAtVA(tagHdrVA, 12)
 		if ok && len(tagHead) > 0 {
-			tagLen, tBytes, ok := readABINameVarint(tagHead)
-			if ok && tagLen > 0 && tagLen <= 4096 {
+			var tagLen, tBytes int
+			var tOK bool
+			if useLegacyUint16 && len(tagHead) >= 2 {
+				tagLen = int(tagHead[0])<<8 | int(tagHead[1])
+				tBytes = 2
+				tOK = true
+			} else {
+				tagLen, tBytes, tOK = readABINameVarint(tagHead)
+			}
+			if tOK && tagLen > 0 && tagLen <= 4096 {
 				if tb, ok := lb.ReadAtVA(tagHdrVA+uint64(tBytes), tagLen); ok && utf8.Valid(tb) {
 					tag = string(tb)
 				}
@@ -624,6 +686,18 @@ func decodeABINameAtVA(lb *loader.LoadedBinary, va uint64) (name, tag string, em
 	}
 
 	return name, tag, embedded, true
+}
+
+func isAllPrintableIdent(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func readABINameVarint(buf []byte) (val, read int, ok bool) {

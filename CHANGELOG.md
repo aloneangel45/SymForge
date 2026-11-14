@@ -5,6 +5,17 @@ All notable changes to **SymForge** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-14
+
+### Fixed
+- **CycloneDX 1.5 SBOM Go Module PURLs (`pkg/exporter`)**: Mapped `gomod` ecosystem entries emitted by `gorecover` `buildinfo` extraction to canonical `pkg:golang/...` Package URLs instead of `pkg:gomod/...`, and populated root application component versions from recovered Go module metadata.
+- **Rust 1.77+ `None`-Drop Trait VTable Recovery (`pkg/rustrecover`)**: Added support for `Option<fn(*mut ())>::None` (`drop_in_place == 0`) trait object vtables in explicit const/RELRO sections with code-entry alignment & padding guards, recovering non-`Drop` concrete trait implementations (e.g., `HmacVerifier`) alongside `Drop`-bearing types, plus 32-bit ELF `.rela` relocation support (`R_386_RELATIVE`, `R_ARM_RELATIVE`).
+- **Mach-O `LC_DYLD_CHAINED_FIXUPS` & `arm64e` Pointer Normalization (`pkg/loader`, `pkg/gorecover`, `pkg/xref`)**: Unified 64-bit Mach-O chained rebase and `arm64e` PAC pointer normalization on `LoadedBinary.NormalizePointer`, fixing static `(ptr, len)` string slicing, indirect string XREFs, section stem lookup (`__TEXT.__gopclntab`, `__DATA,.dep-v0`), and `uint64` VA range wraparound edge cases.
+- **Go <= 1.16 Type Name & Nested Anonymous Type Recovery (`pkg/gorecover`)**: Added legacy big-endian `uint16` `abi.Name` length/tag decoding alongside Go 1.17+ varints and traversed anonymous `struct`/`interface` wrappers when discovering nested named types.
+- **JSON-RPC 2.0 Batch & Explicit `null` ID Compliance (`pkg/mcpserver`)**: Distinguished omitted `"id"` notifications from explicit `"id": null` requests and added JSON-RPC 2.0 batch request array (`[...]`) handling across `stdio` and HTTP transports.
+- **Zero-Disk-Reread Function Disassembly & Cold-Cache Stampede Protection (`pkg/analyzer`, `pkg/exporter`)**: Retained `LoadedBinary` in the bounded analysis cache for in-memory `InspectFunction` disassembly, deduplicated concurrent cold-cache `AnalyzeFile` calls per `(path, size, mtime)`, and added PyGhidra (Python 3) `println` compatibility to Ghidra script exports.
+- **CI / Release Workflow Resilience (`.github/workflows`)**: Eliminated external `sh.rustup.rs` network flakiness when `rustc` is preinstalled on GitHub-hosted runners and enabled Node 24 execution for JavaScript Actions.
+
 ## [1.0.0] - 2026-11-14
 
 ### Added

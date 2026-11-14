@@ -169,4 +169,54 @@ func TestHTTPStreamableAndAllTools(t *testing.T) {
 	if !strings.Contains(outExport, `"written": true`) {
 		t.Fatalf("unexpected export_re_script output:\n%s", outExport)
 	}
+
+	// Verify explicit "id": null produces a response with "id": null (JSON-RPC 2.0 spec)
+	nullIDResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":null,"method":"ping"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nullIDResp.Body.Close()
+	if nullIDResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for explicit id:null, got %d", nullIDResp.StatusCode)
+	}
+	var nullBody map[string]any
+	if err := json.NewDecoder(nullIDResp.Body).Decode(&nullBody); err != nil {
+		t.Fatal(err)
+	}
+	if v, exists := nullBody["id"]; !exists || v != nil {
+		t.Fatalf("expected explicit id:null in response, got %+v", nullBody)
+	}
+
+	// Verify JSON-RPC 2.0 batch array (1 ping + 1 notification + 1 tools/list -> 2 responses)
+	batchPayload := `[
+		{"jsonrpc":"2.0","id":101,"method":"ping"},
+		{"jsonrpc":"2.0","method":"notifications/initialized"},
+		{"jsonrpc":"2.0","id":102,"method":"tools/list"}
+	]`
+	batchResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(batchPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer batchResp.Body.Close()
+	var batchOut []map[string]any
+	if err := json.NewDecoder(batchResp.Body).Decode(&batchOut); err != nil {
+		t.Fatalf("failed to decode batch response array: %v", err)
+	}
+	if len(batchOut) != 2 {
+		t.Fatalf("expected 2 responses in batch (notification omitted), got %d: %+v", len(batchOut), batchOut)
+	}
+
+	// Empty batch [] must return -32600 Invalid Request
+	emptyBatchResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`[]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emptyBatchResp.Body.Close()
+	var emptyErr map[string]any
+	if err := json.NewDecoder(emptyBatchResp.Body).Decode(&emptyErr); err != nil {
+		t.Fatal(err)
+	}
+	if emptyErr["error"] == nil {
+		t.Fatalf("expected JSON-RPC error for empty batch [], got %+v", emptyErr)
+	}
 }

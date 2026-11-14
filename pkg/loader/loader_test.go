@@ -85,3 +85,63 @@ func TestLoadBytes_RejectsMalformedAndTinyInputs(t *testing.T) {
 		t.Fatal("expected error for truncated ELF")
 	}
 }
+
+func TestNormalizePointerSectionStemAndOverflowSafety(t *testing.T) {
+	lb := &LoadedBinary{
+		Info: model.BinaryInfo{
+			Format:      model.FormatMachO,
+			Arch:        model.ArchARM64,
+			PointerSize: 8,
+			ImageBase:   0x100000000,
+		},
+		Sections: []model.SectionInfo{
+			{
+				Name:        "__TEXT.__gopclntab",
+				VirtualAddr: 0x100080000,
+				VirtualSize: 0x4000,
+				FileOffset:  0x100,
+				FileSize:    0x4000,
+			},
+			{
+				Name:        "__DATA,.dep-v0",
+				VirtualAddr: 0x100090000,
+				VirtualSize: 0x1000,
+				FileOffset:  0x4100,
+				FileSize:    0x1000,
+			},
+			{
+				Name:        "__WRAP",
+				VirtualAddr: ^uint64(0) - 15,
+				VirtualSize: 64, // VirtualAddr + VirtualSize would wrap uint64 without subtraction check
+				FileOffset:  0,
+				FileSize:    16,
+			},
+		},
+		raw: make([]byte, 0x6000),
+	}
+
+	// 1. Mach-O chained rebase (ImageBase + low36)
+	chainedOffset := uint64(0x0010000000080120) // high bits metadata, low36 = 0x80120 -> 0x100080120
+	if got := lb.NormalizePointer(chainedOffset); got != 0x100080120 {
+		t.Fatalf("NormalizePointer(chainedOffset) = 0x%x, want 0x100080120", got)
+	}
+
+	// 2. Mach-O arm64e PAC authenticated rebase ((ptr>>62)==2, low32 = offset from ImageBase)
+	pacPtr := (uint64(2) << 62) | 0x00090040
+	if got := lb.NormalizePointer(pacPtr); got != 0x100090040 {
+		t.Fatalf("NormalizePointer(pacPtr) = 0x%x, want 0x100090040", got)
+	}
+
+	// 3. Normalized section stem matching across Mach-O dot/comma prefixes
+	if sec, _, ok := lb.SectionByName(".gopclntab"); !ok || sec == nil || sec.VirtualAddr != 0x100080000 {
+		t.Fatalf("SectionByName(.gopclntab) failed on __TEXT.__gopclntab: %+v", sec)
+	}
+	if sec, _, ok := lb.SectionByName(".dep-v0"); !ok || sec == nil || sec.VirtualAddr != 0x100090000 {
+		t.Fatalf("SectionByName(.dep-v0) failed on __DATA,.dep-v0: %+v", sec)
+	}
+
+	// 4. uint64 wraparound safety: low address 0x5 must NOT match __WRAP (^uint64(0)-15 + 64 wraps past 0x5)
+	if _, ok := lb.VAToOffset(0x5); ok {
+		t.Fatalf("VAToOffset(0x5) falsely matched overflowed section range")
+	}
+}

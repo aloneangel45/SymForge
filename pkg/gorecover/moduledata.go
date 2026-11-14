@@ -360,28 +360,10 @@ func parseTextSectSlice(
 
 // normalizePointer resolves pointers that may carry Apple Mach-O LC_DYLD_CHAINED_FIXUPS metadata.
 func normalizePointer(lb *loader.LoadedBinary, ptr uint64) uint64 {
-	if ptr == 0 || lb == nil {
+	if lb == nil {
 		return 0
 	}
-	if lb.SectionContainingVA(ptr) != nil {
-		return ptr
-	}
-	if (lb.Info.Format == model.FormatMachO || lb.Info.Format == model.FormatMachOFat) && lb.Info.PointerSize == 8 {
-		// Chained rebase pointers have bit 63 == 0 (bind == 0) and 36-bit target or image-base offset.
-		if (ptr >> 63) == 0 {
-			low36 := ptr & 0xfffffffff
-			candOffset := lb.Info.ImageBase + low36
-			if lb.SectionContainingVA(candOffset) != nil {
-				return candOffset
-			}
-			high8 := (ptr >> 36) & 0xff
-			candTarget := (high8 << 56) | low36
-			if lb.SectionContainingVA(candTarget) != nil {
-				return candTarget
-			}
-		}
-	}
-	return ptr
+	return lb.NormalizePointer(ptr)
 }
 
 func minUint64(a, b uint64) uint64 {

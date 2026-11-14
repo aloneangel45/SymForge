@@ -92,10 +92,10 @@ func LoadBytes(path string, data []byte) (*LoadedBinary, error) {
 		}
 	}
 	lb.Info.MaxEntropy = math.Round(maxEnt*1000) / 1000
+	// Flag high-entropy executable section (> 7.45 bits/byte on >= 16 KiB code section)
 	if hasUPXSection || bytes.Contains(data[:minInt(len(data), 4096)], []byte("UPX!")) {
 		lb.Info.PackedLikely = true
 	} else {
-		// Flag high-entropy executable section (> 7.45 bits/byte on >= 16 KiB code section)
 		for _, s := range lb.Sections {
 			if s.Executable && s.FileSize >= 16384 && s.Entropy > 7.45 {
 				lb.Info.PackedLikely = true
@@ -112,14 +112,47 @@ func (b *LoadedBinary) Raw() []byte {
 	return b.raw
 }
 
+// NormalizePointer decodes platform-encoded raw pointer words (such as Apple Mach-O 64-bit
+// LC_DYLD_CHAINED_FIXUPS rebase and arm64e PAC rebase pointers) into canonical virtual addresses.
+func (b *LoadedBinary) NormalizePointer(ptr uint64) uint64 {
+	if ptr == 0 || b == nil {
+		return 0
+	}
+	if b.SectionContainingVA(ptr) != nil {
+		return ptr
+	}
+	if (b.Info.Format == model.FormatMachO || b.Info.Format == model.FormatMachOFat) && b.Info.PointerSize == 8 {
+		if (ptr >> 63) == 0 {
+			low36 := ptr & 0xfffffffff
+			if b.SectionContainingVA(low36) != nil {
+				return low36
+			}
+			candOffset := b.Info.ImageBase + low36
+			if candOffset >= b.Info.ImageBase && b.SectionContainingVA(candOffset) != nil {
+				return candOffset
+			}
+			high8 := (ptr >> 36) & 0xff
+			candTarget := (high8 << 56) | low36
+			if b.SectionContainingVA(candTarget) != nil {
+				return candTarget
+			}
+		} else if (ptr >> 62) == 2 {
+			// arm64e authenticated rebase pointer (auth=1, bind=0): low 32 bits = offset from ImageBase
+			candPAC := b.Info.ImageBase + (ptr & 0xffffffff)
+			if candPAC >= b.Info.ImageBase && b.SectionContainingVA(candPAC) != nil {
+				return candPAC
+			}
+		}
+	}
+	return ptr
+}
+
 // VAToOffset converts a virtual address to a file byte offset within b.raw.
 func (b *LoadedBinary) VAToOffset(va uint64) (uint64, bool) {
 	for i := range b.Sections {
 		s := &b.Sections[i]
-		if s.FileSize == 0 || s.VirtualAddr == 0 && s.FileOffset == 0 && i > 0 {
-			if s.FileSize == 0 {
-				continue
-			}
+		if s.FileSize == 0 {
+			continue
 		}
 		span := s.VirtualSize
 		if span < s.FileSize {
@@ -128,16 +161,15 @@ func (b *LoadedBinary) VAToOffset(va uint64) (uint64, bool) {
 		if span == 0 {
 			continue
 		}
-		if va >= s.VirtualAddr && va < s.VirtualAddr+span {
+		if va >= s.VirtualAddr && va-s.VirtualAddr < span {
 			delta := va - s.VirtualAddr
 			if delta >= s.FileSize {
 				return 0, false
 			}
-			off := s.FileOffset + delta
-			if off >= uint64(len(b.raw)) {
+			if s.FileOffset > uint64(len(b.raw)) || delta >= uint64(len(b.raw))-s.FileOffset {
 				return 0, false
 			}
-			return off, true
+			return s.FileOffset + delta, true
 		}
 	}
 	return 0, false
@@ -150,7 +182,7 @@ func (b *LoadedBinary) OffsetToVA(off uint64) (uint64, bool) {
 		if s.FileSize == 0 {
 			continue
 		}
-		if off >= s.FileOffset && off < s.FileOffset+s.FileSize {
+		if off >= s.FileOffset && off-s.FileOffset < s.FileSize {
 			return s.VirtualAddr + (off - s.FileOffset), true
 		}
 	}
@@ -169,14 +201,13 @@ func (b *LoadedBinary) ReadAtVA(va uint64, n int) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	end := off + uint64(n)
-	if end < off || end > uint64(len(b.raw)) {
+	if uint64(n) > uint64(len(b.raw))-off {
 		return nil, false
 	}
-	return b.raw[off:end], true
+	return b.raw[off : off+uint64(n)], true
 }
 
-// ReadPtrAtVA reads a pointer-sized unsigned integer at virtual address va.
+// ReadPtrAtVA reads a pointer-sized unsigned integer at virtual address va and normalizes chained fixups.
 func (b *LoadedBinary) ReadPtrAtVA(va uint64) (uint64, bool) {
 	ps := b.Info.PointerSize
 	if ps != 4 && ps != 8 {
@@ -187,7 +218,7 @@ func (b *LoadedBinary) ReadPtrAtVA(va uint64) (uint64, bool) {
 		return 0, false
 	}
 	if ps == 8 {
-		return b.Order.Uint64(buf), true
+		return b.NormalizePointer(b.Order.Uint64(buf)), true
 	}
 	return uint64(b.Order.Uint32(buf)), true
 }
@@ -207,9 +238,10 @@ func (b *LoadedBinary) ReadCStringAtVA(va uint64, maxLen int) (string, bool) {
 	if !ok || maxLen <= 0 {
 		return "", false
 	}
-	limit := off + uint64(maxLen)
-	if limit > uint64(len(b.raw)) {
-		limit = uint64(len(b.raw))
+	avail := uint64(len(b.raw)) - off
+	limit := off + avail
+	if uint64(maxLen) < avail {
+		limit = off + uint64(maxLen)
 	}
 	slice := b.raw[off:limit]
 	idx := bytes.IndexByte(slice, 0)
@@ -221,12 +253,27 @@ func (b *LoadedBinary) ReadCStringAtVA(va uint64, maxLen int) (string, bool) {
 
 // SectionByName looks up the first section matching any of names (case-insensitive, ignoring leading '.' or '__' differences when exact fails).
 func (b *LoadedBinary) SectionByName(names ...string) (*model.SectionInfo, []byte, bool) {
+	// Pass 1: exact case-insensitive match.
 	for _, want := range names {
 		for i := range b.Sections {
 			s := &b.Sections[i]
 			if strings.EqualFold(s.Name, want) {
-				data, ok := b.SectionBytes(s)
-				if ok {
+				if data, ok := b.SectionBytes(s); ok {
+					return s, data, true
+				}
+			}
+		}
+	}
+	// Pass 2: normalized stem match (e.g. "__TEXT.__gopclntab" or "__DATA,.dep-v0" matching ".gopclntab" or ".dep-v0").
+	for _, want := range names {
+		wantStem := canonicalSectionStem(want)
+		if wantStem == "" {
+			continue
+		}
+		for i := range b.Sections {
+			s := &b.Sections[i]
+			if canonicalSectionStem(s.Name) == wantStem {
+				if data, ok := b.SectionBytes(s); ok {
 					return s, data, true
 				}
 			}
@@ -235,16 +282,27 @@ func (b *LoadedBinary) SectionByName(names ...string) (*model.SectionInfo, []byt
 	return nil, nil, false
 }
 
+func canonicalSectionStem(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if comma := strings.IndexByte(n, ','); comma >= 0 {
+		n = n[comma+1:]
+	} else if strings.HasPrefix(n, "__") {
+		if dot := strings.IndexByte(n, '.'); dot > 2 {
+			n = n[dot+1:]
+		}
+	}
+	return strings.TrimLeft(n, "._")
+}
+
 // SectionBytes returns the raw file bytes backing section s.
 func (b *LoadedBinary) SectionBytes(s *model.SectionInfo) ([]byte, bool) {
 	if s == nil || s.FileSize == 0 {
 		return nil, false
 	}
-	end := s.FileOffset + s.FileSize
-	if end < s.FileOffset || end > uint64(len(b.raw)) {
+	if s.FileOffset > uint64(len(b.raw)) || s.FileSize > uint64(len(b.raw))-s.FileOffset {
 		return nil, false
 	}
-	return b.raw[s.FileOffset:end], true
+	return b.raw[s.FileOffset : s.FileOffset+s.FileSize], true
 }
 
 // SectionContainingVA returns the section whose virtual range contains va, or nil.
@@ -255,7 +313,7 @@ func (b *LoadedBinary) SectionContainingVA(va uint64) *model.SectionInfo {
 		if span < s.FileSize {
 			span = s.FileSize
 		}
-		if span > 0 && va >= s.VirtualAddr && va < s.VirtualAddr+span {
+		if span > 0 && va >= s.VirtualAddr && va-s.VirtualAddr < span {
 			return s
 		}
 	}

@@ -155,7 +155,7 @@ func (se *stringExtractor) scanStaticGoStringHeaders() {
 		for off := 0; off <= limit; off += ptrSize {
 			var strPtr, strLen uint64
 			if ptrSize == 8 {
-				strPtr = order.Uint64(buf[off : off+8])
+				strPtr = se.lb.NormalizePointer(order.Uint64(buf[off : off+8]))
 				strLen = order.Uint64(buf[off+8 : off+16])
 			} else {
 				strPtr = uint64(order.Uint32(buf[off : off+4]))

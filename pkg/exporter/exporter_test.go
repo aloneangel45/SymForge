@@ -67,7 +67,7 @@ func sampleResult() *model.AnalysisResult {
 			},
 		},
 		Dependencies: []model.Dependency{
-			{Name: "golang.org/x/crypto", Version: "v0.31.0", Ecosystem: "golang", Source: "go.buildinfo"},
+			{Name: "golang.org/x/crypto", Version: "v0.31.0", Ecosystem: "gomod", Source: "buildinfo"},
 			{Name: "serde", Version: "1.0.215", Ecosystem: "cargo", Source: "rust.dep-v0"},
 		},
 		Strings: []model.ExtractedString{
@@ -92,6 +92,9 @@ func TestExportAllFormats(t *testing.T) {
 	}
 	if strings.Contains(gs, "runtime.gopark") {
 		t.Fatalf("UserOnly=true leaked runtime.gopark into ghidra script")
+	}
+	if !strings.Contains(gs, "println = print") {
+		t.Fatalf("expected PyGhidra Python 3 println fallback in ghidra script")
 	}
 
 	idaOut, err := Export(res, FormatIDA, Options{UserOnly: false})
@@ -131,8 +134,8 @@ func TestExportAllFormats(t *testing.T) {
 	}
 	meta := parsed["metadata"].(map[string]any)
 	comp := meta["component"].(map[string]any)
-	if comp["name"] != "vaultd.exe" {
-		t.Fatalf("expected normalized Windows basename vaultd.exe, got %v", comp["name"])
+	if comp["name"] != "vaultd.exe" || comp["version"] != "v1.4.0" {
+		t.Fatalf("expected normalized Windows basename vaultd.exe and version v1.4.0, got name=%v version=%v", comp["name"], comp["version"])
 	}
 	if !strings.Contains(string(sbomOut), "pkg:golang/golang.org/x/crypto@v0.31.0") || !strings.Contains(string(sbomOut), "pkg:cargo/serde@1.0.215") {
 		t.Fatalf("missing expected purls in SBOM:\n%s", string(sbomOut))

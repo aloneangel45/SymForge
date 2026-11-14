@@ -502,6 +502,92 @@ func TestSymbolParsingAndDependencyReplacements(t *testing.T) {
 	}
 }
 
+func TestDecodeABINameAtVALegacyUint16AndVarint(t *testing.T) {
+	// Construct a tiny synthetic ELF with both Go <=1.16 uint16 BE abi.Name and Go 1.17+ varint abi.Name
+	payload := make([]byte, 128)
+	// Offset 0: Go <= 1.16 abi.Name: bits = (1<<0 exported)|(1<<1 hasTag)|(1<<3 embedded) = 0x0b
+	// nameLen = uint16 BE 9 ("AuditMeta"), tagLen = uint16 BE 11 (`json:"meta"`)
+	legacy := []byte{0x0b, 0x00, 0x09}
+	legacy = append(legacy, []byte("AuditMeta")...)
+	legacy = append(legacy, 0x00, 0x0b)
+	legacy = append(legacy, []byte(`json:"meta"`)...)
+	copy(payload[0:], legacy)
+
+	// Offset 48: Go 1.17+ varint abi.Name: bits = 0x03 (exported + hasTag), varint len 6 ("Listen"), varint tag len 10 (`env:"PORT"`)
+	modern := []byte{0x03, 0x06}
+	modern = append(modern, []byte("Listen")...)
+	modern = append(modern, 0x0a)
+	modern = append(modern, []byte(`env:"PORT"`)...)
+	copy(payload[48:], modern)
+
+	lb := &loader.LoadedBinary{
+		Info: model.BinaryInfo{Format: model.FormatELF, PointerSize: 8},
+		Sections: []model.SectionInfo{
+			{Name: ".rodata", VirtualAddr: 0x500000, VirtualSize: uint64(len(payload)), FileOffset: 0, FileSize: uint64(len(payload))},
+		},
+	}
+	// Use LoadBytes on a minimal ELF so lb.raw is populated cleanly
+	const (
+		ehdrSize = 64
+		phdrSize = 56
+		shdrSize = 64
+		roOff    = 0x200
+		roVA     = 0x500000
+	)
+	shstr := []byte("\x00.rodata\x00.shstrtab\x00")
+	shoff := (roOff + len(payload) + len(shstr) + 7) &^ 7
+	elfBuf := make([]byte, shoff+3*shdrSize)
+	copy(elfBuf[0:4], []byte{0x7f, 'E', 'L', 'F'})
+	elfBuf[4], elfBuf[5], elfBuf[6] = 2, 1, 1
+	binary.LittleEndian.PutUint16(elfBuf[16:18], 2)
+	binary.LittleEndian.PutUint16(elfBuf[18:20], 62)
+	binary.LittleEndian.PutUint32(elfBuf[20:24], 1)
+	binary.LittleEndian.PutUint64(elfBuf[32:40], ehdrSize)
+	binary.LittleEndian.PutUint64(elfBuf[40:48], uint64(shoff))
+	binary.LittleEndian.PutUint16(elfBuf[52:54], ehdrSize)
+	binary.LittleEndian.PutUint16(elfBuf[54:56], phdrSize)
+	binary.LittleEndian.PutUint16(elfBuf[56:58], 1)
+	binary.LittleEndian.PutUint16(elfBuf[58:60], shdrSize)
+	binary.LittleEndian.PutUint16(elfBuf[60:62], 3)
+	binary.LittleEndian.PutUint16(elfBuf[62:64], 2)
+	ph := elfBuf[ehdrSize : ehdrSize+phdrSize]
+	binary.LittleEndian.PutUint32(ph[0:4], 1)
+	binary.LittleEndian.PutUint32(ph[4:8], 4)
+	binary.LittleEndian.PutUint64(ph[16:24], roVA-roOff)
+	binary.LittleEndian.PutUint64(ph[32:40], uint64(len(elfBuf)))
+	binary.LittleEndian.PutUint64(ph[40:48], uint64(len(elfBuf)))
+	copy(elfBuf[roOff:], payload)
+	copy(elfBuf[roOff+len(payload):], shstr)
+	s1 := elfBuf[shoff+shdrSize : shoff+2*shdrSize]
+	binary.LittleEndian.PutUint32(s1[0:4], 1)
+	binary.LittleEndian.PutUint32(s1[4:8], 1)
+	binary.LittleEndian.PutUint64(s1[8:16], 0x2)
+	binary.LittleEndian.PutUint64(s1[16:24], roVA)
+	binary.LittleEndian.PutUint64(s1[24:32], roOff)
+	binary.LittleEndian.PutUint64(s1[32:40], uint64(len(payload)))
+	s2 := elfBuf[shoff+2*shdrSize : shoff+3*shdrSize]
+	binary.LittleEndian.PutUint32(s2[0:4], 9)
+	binary.LittleEndian.PutUint32(s2[4:8], 3)
+	binary.LittleEndian.PutUint64(s2[24:32], uint64(roOff+len(payload)))
+	binary.LittleEndian.PutUint64(s2[32:40], uint64(len(shstr)))
+
+	var err error
+	lb, err = loader.LoadBytes("abiname.elf", elfBuf)
+	if err != nil {
+		t.Fatalf("LoadBytes: %v", err)
+	}
+
+	name1, tag1, emb1, ok1 := decodeABINameAtVA(lb, roVA)
+	if !ok1 || name1 != "AuditMeta" || tag1 != `json:"meta"` || !emb1 {
+		t.Fatalf("legacy Go <=1.16 abi.Name decode = (%q, %q, %v, %v), want (AuditMeta, json:\"meta\", true, true)", name1, tag1, emb1, ok1)
+	}
+
+	name2, tag2, emb2, ok2 := decodeABINameAtVA(lb, roVA+48)
+	if !ok2 || name2 != "Listen" || tag2 != `env:"PORT"` || emb2 {
+		t.Fatalf("Go 1.17+ varint abi.Name decode = (%q, %q, %v, %v), want (Listen, env:\"PORT\", false, true)", name2, tag2, emb2, ok2)
+	}
+}
+
 func bytesRepeat(b byte, n int) []byte {
 	out := make([]byte, n)
 	for i := range out {

@@ -38,7 +38,7 @@ type Server struct {
 // New creates a new SymForge MCP server bound to engine.
 func New(version string, engine *analyzer.Engine) *Server {
 	if version == "" {
-		version = "1.0.0"
+		version = "1.0.1"
 	}
 	if engine == nil {
 		engine = analyzer.DefaultEngine
@@ -52,7 +52,7 @@ func New(version string, engine *analyzer.Engine) *Server {
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      any             `json:"id,omitempty"`
+	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
 }
@@ -197,34 +197,110 @@ func readNextMessage(br *bufio.Reader) ([]byte, frameMode, error) {
 }
 
 func (s *Server) handleRawJSON(raw []byte) ([]byte, bool) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-
-	var req rpcRequest
-	if err := dec.Decode(&req); err != nil {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
 		resp := rpcResponse{
 			JSONRPC: "2.0",
 			ID:      nil,
-			Error:   &rpcError{Code: -32700, Message: "Parse error: " + err.Error()},
+			Error:   &rpcError{Code: -32700, Message: "Parse error: empty JSON payload"},
 		}
 		out, _ := json.Marshal(resp)
 		return out, true
 	}
 
-	// JSON-RPC notifications omit "id" and must not receive a response.
-	if req.ID == nil && (strings.HasPrefix(req.Method, "notifications/") || req.Method == "initialized") {
-		return nil, false
-	}
-	if req.ID == nil && req.Method != "" {
-		return nil, false
+	// JSON-RPC 2.0 batch request array [...]
+	if trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(trimmed, &batch); err != nil {
+			resp := rpcResponse{
+				JSONRPC: "2.0",
+				ID:      nil,
+				Error:   &rpcError{Code: -32700, Message: "Parse error: " + err.Error()},
+			}
+			out, _ := json.Marshal(resp)
+			return out, true
+		}
+		if len(batch) == 0 {
+			resp := rpcResponse{
+				JSONRPC: "2.0",
+				ID:      nil,
+				Error:   &rpcError{Code: -32600, Message: "Invalid Request: empty batch"},
+			}
+			out, _ := json.Marshal(resp)
+			return out, true
+		}
+		var replies []rpcResponse
+		for _, elem := range batch {
+			if r, ok := s.handleSingleRequest(elem); ok {
+				replies = append(replies, r)
+			}
+		}
+		if len(replies) == 0 {
+			return nil, false
+		}
+		out, _ := json.Marshal(replies)
+		return out, true
 	}
 
-	resp := s.dispatch(req)
+	resp, ok := s.handleSingleRequest(trimmed)
+	if !ok {
+		return nil, false
+	}
 	out, _ := json.Marshal(resp)
 	return out, true
 }
 
-func (s *Server) dispatch(req rpcRequest) rpcResponse {
+func (s *Server) handleSingleRequest(raw []byte) (rpcResponse, bool) {
+	var req rpcRequest
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
+		return rpcResponse{
+			JSONRPC: "2.0",
+			ID:      nil,
+			Error:   &rpcError{Code: -32700, Message: "Parse error: " + err.Error()},
+		}, true
+	}
+
+	idRaw := bytes.TrimSpace(req.ID)
+	// Per JSON-RPC 2.0: a Notification omits the "id" member entirely (len(idRaw) == 0).
+	// An explicit `"id": null` is NOT a notification and must receive a response with `"id": null`.
+	if len(idRaw) == 0 {
+		if req.Method == "" {
+			return rpcResponse{
+				JSONRPC: "2.0",
+				ID:      nil,
+				Error:   &rpcError{Code: -32600, Message: "Invalid Request: missing method"},
+			}, true
+		}
+		return rpcResponse{}, false
+	}
+
+	if req.Method == "" {
+		return rpcResponse{
+			JSONRPC: "2.0",
+			ID:      decodeIDValue(idRaw),
+			Error:   &rpcError{Code: -32600, Message: "Invalid Request: missing method"},
+		}, true
+	}
+
+	return s.dispatch(req, decodeIDValue(idRaw)), true
+}
+
+func decodeIDValue(idRaw []byte) any {
+	if len(idRaw) == 0 || bytes.Equal(idRaw, []byte("null")) {
+		return nil
+	}
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(idRaw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil
+	}
+	return v
+}
+
+func (s *Server) dispatch(req rpcRequest, reqID any) rpcResponse {
 	switch req.Method {
 	case "initialize":
 		var p struct {
@@ -237,7 +313,7 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 		}
 		return rpcResponse{
 			JSONRPC: "2.0",
-			ID:      req.ID,
+			ID:      reqID,
 			Result: map[string]any{
 				"protocolVersion": proto,
 				"capabilities": map[string]any{
@@ -255,14 +331,14 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 	case "ping":
 		return rpcResponse{
 			JSONRPC: "2.0",
-			ID:      req.ID,
+			ID:      reqID,
 			Result:  map[string]any{},
 		}
 
 	case "tools/list":
 		return rpcResponse{
 			JSONRPC: "2.0",
-			ID:      req.ID,
+			ID:      reqID,
 			Result: map[string]any{
 				"tools": s.toolDefinitions(),
 			},
@@ -271,14 +347,14 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 	case "resources/list":
 		return rpcResponse{
 			JSONRPC: "2.0",
-			ID:      req.ID,
+			ID:      reqID,
 			Result:  map[string]any{"resources": []any{}},
 		}
 
 	case "prompts/list":
 		return rpcResponse{
 			JSONRPC: "2.0",
-			ID:      req.ID,
+			ID:      reqID,
 			Result:  map[string]any{"prompts": []any{}},
 		}
 
@@ -290,7 +366,7 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(req.Params, &callParams); err != nil {
 			return rpcResponse{
 				JSONRPC: "2.0",
-				ID:      req.ID,
+				ID:      reqID,
 				Error:   &rpcError{Code: -32602, Message: "Invalid tools/call params: " + err.Error()},
 			}
 		}
@@ -298,13 +374,13 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 		if rpcErr != nil {
 			return rpcResponse{
 				JSONRPC: "2.0",
-				ID:      req.ID,
+				ID:      reqID,
 				Error:   rpcErr,
 			}
 		}
 		return rpcResponse{
 			JSONRPC: "2.0",
-			ID:      req.ID,
+			ID:      reqID,
 			Result: map[string]any{
 				"content": []map[string]any{
 					{
@@ -319,7 +395,7 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 	default:
 		return rpcResponse{
 			JSONRPC: "2.0",
-			ID:      req.ID,
+			ID:      reqID,
 			Error:   &rpcError{Code: -32601, Message: fmt.Sprintf("Method not found: %s", req.Method)},
 		}
 	}
