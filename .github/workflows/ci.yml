@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - name: Setup Rust Toolchain (for stripped Rust binary integration tests)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify pure-Go static analysis (go vet)
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Run full test suite (Linux / macOS with -race)
+        if: runner.os != 'Windows'
+        run: go test -v -race -count=1 ./...
+
+      - name: Run full test suite (Windows pure-Go)
+        if: runner.os == 'Windows'
+        env:
+          CGO_ENABLED: "0"
+        run: go test -v -count=1 ./...
+
+      - name: Build CLI binary
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w -X main.Version=ci" ./cmd/symforge

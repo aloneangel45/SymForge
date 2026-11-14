@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Multi-Arch Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run pre-release verification gate
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go test -v -count=1 ./...
+
+      - name: Cross-compile release archives & SHA-256 checksums
+        env:
+          CGO_ENABLED: "0"
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG_NAME#v}"
+          mkdir -p dist
+
+          build_unix() {
+            local goos="$1"
+            local goarch="$2"
+            local stage="dist/stage-${goos}-${goarch}"
+            mkdir -p "$stage"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
+              -o "${stage}/symforge" ./cmd/symforge
+            cp LICENSE README.md "$stage/"
+            tar -C "$stage" -czf "dist/symforge-${goos}-${goarch}.tar.gz" symforge LICENSE README.md
+            rm -rf "$stage"
+          }
+
+          build_windows() {
+            local goarch="$1"
+            local stage="dist/stage-windows-${goarch}"
+            mkdir -p "$stage"
+            GOOS="windows" GOARCH="$goarch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
+              -o "${stage}/symforge.exe" ./cmd/symforge
+            cp LICENSE README.md "$stage/"
+            (cd "$stage" && zip -q "../symforge-windows-${goarch}.zip" symforge.exe LICENSE README.md)
+            rm -rf "$stage"
+          }
+
+          build_unix linux amd64
+          build_unix linux arm64
+          build_unix darwin amd64
+          build_unix darwin arm64
+          build_windows amd64
+          build_windows arm64
+
+          (
+            cd dist
+            sha256sum symforge-*.tar.gz symforge-*.zip > checksums.txt
+            cat checksums.txt
+          )
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/symforge-linux-amd64.tar.gz
+            dist/symforge-linux-arm64.tar.gz
+            dist/symforge-darwin-amd64.tar.gz
+            dist/symforge-darwin-arm64.tar.gz
+            dist/symforge-windows-amd64.zip
+            dist/symforge-windows-arm64.zip
+            dist/checksums.txt
