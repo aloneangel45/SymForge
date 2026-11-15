@@ -2,7 +2,9 @@
 # Usage: irm https://raw.githubusercontent.com/aloneangel45/SymForge/main/install.ps1 | iex
 $ErrorActionPreference = 'Stop'
 
-Add-Type -AssemblyName System.IO.Compression.FileSystem
+if (-not ('System.IO.Compression.ZipFile' -as [type])) {
+    [void][System.Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem')
+}
 
 $Repo = if ($env:SYMFORGE_REPO) { $env:SYMFORGE_REPO } else { 'aloneangel45/SymForge' }
 $Version = if ($env:SYMFORGE_VERSION) { $env:SYMFORGE_VERSION } else { 'latest' }
@@ -45,7 +47,7 @@ function Download-SymForgeFile([string]$Url, [string]$Dest) {
         [System.IO.File]::Copy($LocalSrc, $Dest, $true)
         return
     }
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
     $wc = New-Object System.Net.WebClient
     try {
         $wc.DownloadFile($Url, $Dest)
@@ -118,7 +120,10 @@ try {
     if (-not $env:SYMFORGE_SKIP_PATH) {
         $UserPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
         if (-not $UserPath) { $UserPath = '' }
-        $Entries = $UserPath -split ';' | Where-Object { $_ -ne '' }
+        $Entries = @()
+        foreach ($seg in ($UserPath -split ';')) {
+            if ($seg -ne '') { $Entries += $seg }
+        }
         $AlreadyPresent = $false
         foreach ($e in $Entries) {
             if ([string]::Equals($e.TrimEnd('\'), $InstallDir.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
