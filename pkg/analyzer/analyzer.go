@@ -20,10 +20,11 @@ import (
 	"github.com/aloneangel45/symforge/pkg/xref"
 )
 
-// Options tunes string extraction and caching limits during full binary analysis.
+// Options tunes string extraction, Fat Mach-O architecture selection, and caching during full binary analysis.
 type Options struct {
 	MinStringLen int
 	MaxStrings   int
+	Arch         string
 	BypassCache  bool
 }
 
@@ -45,6 +46,7 @@ type cacheKey struct {
 	absPath   string
 	size      int64
 	mtimeNano int64
+	arch      string
 }
 
 type cacheEntry struct {
@@ -106,10 +108,20 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 		return nil, fmt.Errorf("target path %q is a directory, expected binary file", path)
 	}
 
+	normArch := ""
+	if strings.TrimSpace(opts.Arch) != "" {
+		a, ok := loader.NormalizeArch(opts.Arch)
+		if !ok {
+			return nil, fmt.Errorf("unsupported architecture %q (expected x86_64/amd64, arm64, x86, or arm)", opts.Arch)
+		}
+		normArch = string(a)
+	}
+
 	ck := cacheKey{
 		absPath:   absPath,
 		size:      st.Size(),
 		mtimeNano: st.ModTime().UnixNano(),
+		arch:      normArch,
 	}
 
 	var flight *inflightAnalysis
@@ -151,7 +163,7 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 	}
 
 	start := time.Now()
-	lb, err := loader.LoadFile(absPath)
+	lb, err := loader.LoadFileWithOptions(absPath, loader.LoadOptions{Arch: opts.Arch})
 	if err != nil {
 		return finishFlight(nil, err)
 	}
@@ -191,7 +203,7 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 // AnalyzeBytes runs full SymForge analysis on raw in-memory binary bytes.
 func AnalyzeBytes(name string, data []byte, opts Options) (*model.AnalysisResult, error) {
 	start := time.Now()
-	lb, err := loader.LoadBytes(name, data)
+	lb, err := loader.LoadBytesWithOptions(name, data, loader.LoadOptions{Arch: opts.Arch})
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +270,7 @@ func AnalyzeLoaded(lb *loader.LoadedBinary, opts Options, start time.Time) (*mod
 	out := &model.AnalysisResult{
 		Binary:             info,
 		Sections:           lb.Sections,
+		Imports:            lb.Imports,
 		Packages:           pkgs,
 		Functions:          xrefRes.Functions,
 		Types:              types,
@@ -307,7 +320,12 @@ func AnalyzeLoaded(lb *loader.LoadedBinary, opts Options, start time.Time) (*mod
 // InspectFunction locates a function by name, demangled name, hex VA, or unique substring,
 // resolves its outgoing/incoming call edges, and optionally decodes machine instructions.
 func (e *Engine) InspectFunction(path, target string, disassemble bool, maxInsns int) (*FunctionInspection, error) {
-	ce, err := e.analyzeCached(path, Options{})
+	return e.InspectFunctionWithOptions(path, target, disassemble, maxInsns, Options{})
+}
+
+// InspectFunctionWithOptions is like InspectFunction with explicit analysis options (such as Fat Mach-O Arch).
+func (e *Engine) InspectFunctionWithOptions(path, target string, disassemble bool, maxInsns int, opts Options) (*FunctionInspection, error) {
+	ce, err := e.analyzeCached(path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +359,7 @@ func (e *Engine) InspectFunction(path, target string, disassemble bool, maxInsns
 		lb := ce.lb
 		if lb == nil {
 			var err error
-			lb, err = loader.LoadFile(ce.key.absPath)
+			lb, err = loader.LoadFileWithOptions(ce.key.absPath, loader.LoadOptions{Arch: opts.Arch})
 			if err != nil {
 				return nil, err
 			}

@@ -21,13 +21,17 @@ const (
 	FormatMarkdown Format = "markdown"
 	FormatSBOM     Format = "sbom"
 	FormatJSON     Format = "json"
+	FormatDOT      Format = "dot"
+	FormatMermaid  Format = "mermaid"
 )
 
 // Options controls filtering and formatting behavior during export.
 type Options struct {
-	// UserOnly restricts exported functions in RE scripts and reports to
+	// UserOnly restricts exported functions in RE scripts, graphs, and reports to
 	// CategoryUser and CategoryDependency (omitting Go/Rust runtime & stdlib noise).
 	UserOnly bool
+	// Limit bounds node counts in visual call-graph exports (dot, mermaid). Defaults to 60 when <= 0.
+	Limit int
 }
 
 // ParseFormat normalizes a user-supplied format name.
@@ -45,8 +49,12 @@ func ParseFormat(raw string) (Format, error) {
 		return FormatSBOM, nil
 	case "json":
 		return FormatJSON, nil
+	case "dot", "graphviz":
+		return FormatDOT, nil
+	case "mermaid", "mmd":
+		return FormatMermaid, nil
 	default:
-		return "", fmt.Errorf("unsupported export format %q (expected ghidra, ida, binja, markdown, sbom, or json)", raw)
+		return "", fmt.Errorf("unsupported export format %q (expected ghidra, ida, binja, markdown, sbom, json, dot, or mermaid)", raw)
 	}
 }
 
@@ -68,6 +76,10 @@ func Export(res *model.AnalysisResult, format Format, opts Options) ([]byte, err
 		return ExportCycloneDX(res)
 	case FormatJSON:
 		return json.MarshalIndent(res, "", "  ")
+	case FormatDOT:
+		return ExportDOT(res, opts), nil
+	case FormatMermaid:
+		return ExportMermaid(res, opts), nil
 	default:
 		return nil, fmt.Errorf("unsupported export format %q", format)
 	}

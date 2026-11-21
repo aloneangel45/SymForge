@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/aloneangel45/symforge/pkg/model"
 )
@@ -130,7 +131,147 @@ func loadPE(path string, data []byte) (*LoadedBinary, error) {
 		lb.RuntimeFuncs = extractPEPDataX64(pf, lb, imageBase)
 	}
 
+	lb.Imports = extractPEImports(pf, lb, imageBase, ptrSize)
+
 	return lb, nil
+}
+
+func extractPEImports(pf *pe.File, lb *LoadedBinary, imageBase uint64, ptrSize int) []model.ImportSymbol {
+	var importDir pe.DataDirectory
+	switch opt := pf.OptionalHeader.(type) {
+	case *pe.OptionalHeader64:
+		if len(opt.DataDirectory) > pe.IMAGE_DIRECTORY_ENTRY_IMPORT {
+			importDir = opt.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT]
+		}
+	case *pe.OptionalHeader32:
+		if len(opt.DataDirectory) > pe.IMAGE_DIRECTORY_ENTRY_IMPORT {
+			importDir = opt.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT]
+		}
+	}
+
+	var imports []model.ImportSymbol
+	if importDir.VirtualAddress != 0 && (ptrSize == 4 || ptrSize == 8) {
+		dirVA := imageBase + uint64(importDir.VirtualAddress)
+		const maxDescriptors = 2048
+		const maxThunksPerDLL = 16384
+
+		for i := 0; i < maxDescriptors; i++ {
+			desc, ok := lb.ReadAtVA(dirVA+uint64(i)*20, 20)
+			if !ok {
+				break
+			}
+			origFirstThunk := binary.LittleEndian.Uint32(desc[0:4])
+			nameRVA := binary.LittleEndian.Uint32(desc[12:16])
+			firstThunk := binary.LittleEndian.Uint32(desc[16:20])
+			if origFirstThunk == 0 && nameRVA == 0 && firstThunk == 0 {
+				break
+			}
+
+			dllName := ""
+			if nameRVA != 0 {
+				if s, ok := lb.ReadCStringAtVA(imageBase+uint64(nameRVA), 260); ok {
+					dllName = s
+				}
+			}
+
+			lookupRVA := origFirstThunk
+			if lookupRVA == 0 {
+				lookupRVA = firstThunk
+			}
+			addedForDLL := 0
+			if lookupRVA != 0 {
+				lookupVA := imageBase + uint64(lookupRVA)
+				for idx := 0; idx < maxThunksPerDLL; idx++ {
+					thunkBytes, ok := lb.ReadAtVA(lookupVA+uint64(idx)*uint64(ptrSize), ptrSize)
+					if !ok {
+						break
+					}
+					var thunk uint64
+					var isOrdinal bool
+					var hintNameRVA uint64
+					if ptrSize == 8 {
+						thunk = binary.LittleEndian.Uint64(thunkBytes)
+						if thunk == 0 {
+							break
+						}
+						isOrdinal = (thunk & (uint64(1) << 63)) != 0
+						hintNameRVA = thunk & 0x7fffffff
+					} else {
+						t32 := binary.LittleEndian.Uint32(thunkBytes)
+						if t32 == 0 {
+							break
+						}
+						thunk = uint64(t32)
+						isOrdinal = (t32 & 0x80000000) != 0
+						hintNameRVA = uint64(t32 & 0x7fffffff)
+					}
+
+					var symName string
+					if isOrdinal {
+						symName = fmt.Sprintf("Ordinal#%d", thunk&0xffff)
+					} else if hintNameRVA != 0 {
+						// IMAGE_IMPORT_BY_NAME: 2-byte Hint followed by null-terminated ASCII name
+						if name, ok := lb.ReadCStringAtVA(imageBase+hintNameRVA+2, 512); ok {
+							symName = name
+						}
+					}
+					if symName == "" && dllName == "" {
+						continue
+					}
+					var iatAddr uint64
+					if firstThunk != 0 {
+						iatAddr = imageBase + uint64(firstThunk) + uint64(idx)*uint64(ptrSize)
+					}
+					imports = append(imports, model.ImportSymbol{
+						Library: dllName,
+						Name:    symName,
+						Address: iatAddr,
+					})
+					addedForDLL++
+				}
+			}
+			if addedForDLL == 0 && dllName != "" {
+				imports = append(imports, model.ImportSymbol{Library: dllName})
+			}
+		}
+	}
+
+	// Graceful fallback to Go stdlib debug/pe if direct IAT/INT directory parsing yielded nothing
+	if len(imports) == 0 {
+		seenLib := make(map[string]struct{})
+		if symStrings, err := pf.ImportedSymbols(); err == nil {
+			for _, entry := range symStrings {
+				if entry == "" {
+					continue
+				}
+				symName := entry
+				dllName := ""
+				if idx := strings.LastIndexByte(entry, ':'); idx > 0 {
+					symName = entry[:idx]
+					dllName = entry[idx+1:]
+				}
+				if dllName != "" {
+					seenLib[strings.ToLower(dllName)] = struct{}{}
+				}
+				imports = append(imports, model.ImportSymbol{
+					Library: dllName,
+					Name:    symName,
+				})
+			}
+		}
+		if libs, err := pf.ImportedLibraries(); err == nil {
+			for _, lib := range libs {
+				if lib == "" {
+					continue
+				}
+				if _, ok := seenLib[strings.ToLower(lib)]; !ok {
+					imports = append(imports, model.ImportSymbol{Library: lib})
+				}
+			}
+		}
+	}
+
+	return imports
 }
 
 func extractPEPDataX64(pf *pe.File, lb *LoadedBinary, imageBase uint64) []model.RuntimeBounds {

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/aloneangel45/symforge/pkg/model"
@@ -19,18 +20,49 @@ import (
 // MaxBinarySize caps loaded binaries at 512 MiB to prevent unbounded memory exhaustion.
 const MaxBinarySize = 512 * 1024 * 1024
 
+// LoadOptions configures optional binary loading behavior such as Fat Mach-O slice selection.
+type LoadOptions struct {
+	Arch string
+}
+
 // LoadedBinary provides immutable, zero-copy access to a parsed executable container.
 type LoadedBinary struct {
 	Info         model.BinaryInfo
 	Sections     []model.SectionInfo
 	Symbols      []model.SymbolEntry
+	Imports      []model.ImportSymbol
 	RuntimeFuncs []model.RuntimeBounds
 	Order        binary.ByteOrder
 	raw          []byte
 }
 
+// NormalizeArch maps user-supplied architecture aliases (e.g. amd64, aarch64, x64, i386)
+// into SymForge's canonical model.Architecture. An empty string returns ("", true).
+func NormalizeArch(raw string) (model.Architecture, bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	switch s {
+	case "":
+		return "", true
+	case "amd64", "x86_64", "x86-64", "x64":
+		return model.ArchX86_64, true
+	case "arm64", "aarch64", "arm64e":
+		return model.ArchARM64, true
+	case "386", "i386", "x86", "ia32":
+		return model.ArchX86, true
+	case "arm", "armv7", "armv7s", "armv6":
+		return model.ArchARM, true
+	default:
+		return model.ArchUnknown, false
+	}
+}
+
 // LoadFile reads path from disk and parses it as ELF, PE, or Mach-O (including Fat universal binaries).
 func LoadFile(path string) (*LoadedBinary, error) {
+	return LoadFileWithOptions(path, LoadOptions{})
+}
+
+// LoadFileWithOptions reads path from disk and parses it with the provided LoadOptions.
+func LoadFileWithOptions(path string, opts LoadOptions) (*LoadedBinary, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat %s: %w", path, err)
@@ -45,13 +77,27 @@ func LoadFile(path string) (*LoadedBinary, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	return LoadBytes(path, data)
+	return LoadBytesWithOptions(path, data, opts)
 }
 
 // LoadBytes parses an in-memory executable image.
 func LoadBytes(path string, data []byte) (*LoadedBinary, error) {
+	return LoadBytesWithOptions(path, data, LoadOptions{})
+}
+
+// LoadBytesWithOptions parses an in-memory executable image using the provided LoadOptions.
+func LoadBytesWithOptions(path string, data []byte, opts LoadOptions) (*LoadedBinary, error) {
 	if len(data) < 16 {
 		return nil, fmt.Errorf("file %s too small to be a valid executable (%d bytes)", path, len(data))
+	}
+
+	var wantArch model.Architecture
+	if strings.TrimSpace(opts.Arch) != "" {
+		norm, ok := NormalizeArch(opts.Arch)
+		if !ok {
+			return nil, fmt.Errorf("unsupported architecture %q (expected x86_64/amd64, arm64, x86, or arm)", opts.Arch)
+		}
+		wantArch = norm
 	}
 
 	sum := sha256.Sum256(data)
@@ -68,7 +114,7 @@ func LoadBytes(path string, data []byte) (*LoadedBinary, error) {
 	case bytes.HasPrefix(data, []byte{'M', 'Z'}):
 		lb, err = loadPE(path, data)
 	case isMachOMagic(data):
-		lb, err = loadMachO(path, data)
+		lb, err = loadMachO(path, data, opts)
 	default:
 		return nil, fmt.Errorf("unsupported executable format in %s (expected ELF, PE, or Mach-O)", path)
 	}
@@ -76,9 +122,14 @@ func LoadBytes(path string, data []byte) (*LoadedBinary, error) {
 		return nil, err
 	}
 
+	if wantArch != "" && lb.Info.Format != model.FormatMachOFat && lb.Info.Arch != wantArch {
+		return nil, fmt.Errorf("requested architecture %q does not match binary architecture %q in %s", opts.Arch, lb.Info.Arch, path)
+	}
+
 	lb.Info.Path = path
 	lb.Info.SHA256 = shaHex
 	lb.Info.SizeBytes = int64(len(data))
+	lb.Imports = sortAndDedupeImports(lb.Imports)
 
 	var maxEnt float64
 	hasUPXSection := false
@@ -351,6 +402,42 @@ func ShannonEntropy(data []byte) float64 {
 		ent -= p * math.Log2(p)
 	}
 	return math.Round(ent*1000) / 1000
+}
+
+func sortAndDedupeImports(in []model.ImportSymbol) []model.ImportSymbol {
+	if len(in) == 0 {
+		return nil
+	}
+	type impKey struct {
+		lib  string
+		name string
+		addr uint64
+	}
+	seen := make(map[impKey]struct{}, len(in))
+	out := make([]model.ImportSymbol, 0, len(in))
+	for _, imp := range in {
+		imp.Library = strings.TrimSpace(imp.Library)
+		imp.Name = strings.TrimSpace(imp.Name)
+		if imp.Library == "" && imp.Name == "" {
+			continue
+		}
+		k := impKey{lib: imp.Library, name: imp.Name, addr: imp.Address}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, imp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Library != out[j].Library {
+			return out[i].Library < out[j].Library
+		}
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Address < out[j].Address
+	})
+	return out
 }
 
 func minInt(a, b int) int {

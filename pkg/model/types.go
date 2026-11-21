@@ -64,20 +64,29 @@ const (
 
 // BinaryInfo holds container-level metadata and structural heuristics.
 type BinaryInfo struct {
-	Path         string       `json:"path"`
-	SHA256       string       `json:"sha256"`
-	SizeBytes    int64        `json:"size_bytes"`
-	Format       BinaryFormat `json:"format"`
-	Arch         Architecture `json:"arch"`
-	Endianness   string       `json:"endianness"`
-	PointerSize  int          `json:"pointer_size"`
-	EntryPoint   uint64       `json:"entry_point"`
-	ImageBase    uint64       `json:"image_base"`
-	PIE          bool         `json:"pie"`
-	Stripped     bool         `json:"stripped"`
-	PackedLikely bool         `json:"packed_likely"`
-	MaxEntropy   float64      `json:"max_entropy"`
-	Language     Language     `json:"language"`
+	Path            string       `json:"path"`
+	SHA256          string       `json:"sha256"`
+	SizeBytes       int64        `json:"size_bytes"`
+	Format          BinaryFormat `json:"format"`
+	Arch            Architecture `json:"arch"`
+	AvailableArches []string     `json:"available_arches,omitempty"`
+	Endianness      string       `json:"endianness"`
+	PointerSize     int          `json:"pointer_size"`
+	EntryPoint      uint64       `json:"entry_point"`
+	ImageBase       uint64       `json:"image_base"`
+	PIE             bool         `json:"pie"`
+	Stripped        bool         `json:"stripped"`
+	PackedLikely    bool         `json:"packed_likely"`
+	MaxEntropy      float64      `json:"max_entropy"`
+	Language        Language     `json:"language"`
+}
+
+// ImportSymbol represents a native imported library and/or dynamic API symbol
+// recovered from ELF dynamic tables, PE IAT/import descriptors, or Mach-O dylib loads.
+type ImportSymbol struct {
+	Library string `json:"library,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Address uint64 `json:"address,omitempty"`
 }
 
 // SectionInfo describes a mapped executable or data section with Shannon entropy.
@@ -248,6 +257,7 @@ type DisasmInstruction struct {
 type AnalysisResult struct {
 	Binary             BinaryInfo        `json:"binary"`
 	Sections           []SectionInfo     `json:"sections"`
+	Imports            []ImportSymbol    `json:"imports,omitempty"`
 	Go                 *GoMetadata       `json:"go,omitempty"`
 	Rust               *RustMetadata     `json:"rust,omitempty"`
 	Packages           []PackageSummary  `json:"packages,omitempty"`

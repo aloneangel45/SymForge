@@ -1,9 +1,13 @@
 package loader
 
 import (
+	"bytes"
+	"debug/macho"
+	"encoding/binary"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aloneangel45/symforge/pkg/model"
@@ -144,4 +148,155 @@ func TestNormalizePointerSectionStemAndOverflowSafety(t *testing.T) {
 	if _, ok := lb.VAToOffset(0x5); ok {
 		t.Fatalf("VAToOffset(0x5) falsely matched overflowed section range")
 	}
+}
+
+func TestNativeImportsAndUniversalFatMachOSelection(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "sample.go")
+	code := `package main
+import "fmt"
+func main() { fmt.Println("symforge-imports-fat-check") }
+`
+	if err := os.WriteFile(src, []byte(code), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	build := func(goos, goarch string) string {
+		outBin := filepath.Join(tmp, goos+"_"+goarch)
+		if goos == "windows" {
+			outBin += ".exe"
+		}
+		cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outBin, src)
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+goos, "GOARCH="+goarch)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go build %s/%s failed: %v\n%s", goos, goarch, err, string(out))
+		}
+		return outBin
+	}
+
+	// 1. PE import table recovery
+	peBin := build("windows", "amd64")
+	lbPE, err := LoadFile(peBin)
+	if err != nil {
+		t.Fatalf("LoadFile PE failed: %v", err)
+	}
+	if len(lbPE.Imports) == 0 {
+		t.Fatalf("expected PE imports > 0, got 0")
+	}
+	foundKernel32 := false
+	for _, imp := range lbPE.Imports {
+		if strings.EqualFold(imp.Library, "kernel32.dll") && imp.Name != "" && imp.Address != 0 {
+			foundKernel32 = true
+			break
+		}
+	}
+	if !foundKernel32 {
+		t.Errorf("expected PE kernel32.dll import with resolved symbol name & IAT VA, got %+v", lbPE.Imports[:minInt(len(lbPE.Imports), 10)])
+	}
+
+	// 2. Mach-O imports + synthetic Universal Fat Mach-O (arm64 + amd64 slices)
+	armBin := build("darwin", "arm64")
+	amdBin := build("darwin", "amd64")
+	armBytes, err := os.ReadFile(armBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	amdBytes, err := os.ReadFile(amdBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lbThinMachO, err := LoadBytes("thin_arm64", armBytes)
+	if err != nil {
+		t.Fatalf("LoadBytes thin Mach-O failed: %v", err)
+	}
+	foundLibSystem := false
+	for _, imp := range lbThinMachO.Imports {
+		if strings.Contains(imp.Library, "libSystem") {
+			foundLibSystem = true
+			break
+		}
+	}
+	if !foundLibSystem {
+		t.Errorf("expected Mach-O libSystem dylib import, got %+v", lbThinMachO.Imports)
+	}
+
+	// Pack arm64 and amd64 slices into a valid 0xCAFEBABE Universal Fat Mach-O binary
+	fatBytes := buildUniversalFatMachO(t, []fatSlice{
+		{cpu: macho.CpuArm64, subCPU: 0, align: 14, data: armBytes},
+		{cpu: macho.CpuAmd64, subCPU: 3, align: 12, data: amdBytes},
+	})
+	fatPath := filepath.Join(tmp, "universal_app")
+	if err := os.WriteFile(fatPath, fatBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lbArm, err := LoadFileWithOptions(fatPath, LoadOptions{Arch: "arm64"})
+	if err != nil {
+		t.Fatalf("LoadFileWithOptions(arm64) failed: %v", err)
+	}
+	if lbArm.Info.Format != model.FormatMachOFat || lbArm.Info.Arch != model.ArchARM64 {
+		t.Fatalf("expected macho-fat/arm64, got %s/%s", lbArm.Info.Format, lbArm.Info.Arch)
+	}
+	if len(lbArm.Info.AvailableArches) != 2 {
+		t.Fatalf("expected 2 AvailableArches, got %v", lbArm.Info.AvailableArches)
+	}
+
+	lbAmd, err := LoadFileWithOptions(fatPath, LoadOptions{Arch: "amd64"})
+	if err != nil {
+		t.Fatalf("LoadFileWithOptions(amd64) failed: %v", err)
+	}
+	if lbAmd.Info.Arch != model.ArchX86_64 {
+		t.Fatalf("expected x86_64 slice, got %s", lbAmd.Info.Arch)
+	}
+
+	if _, err := LoadFileWithOptions(fatPath, LoadOptions{Arch: "arm"}); err == nil {
+		t.Fatalf("expected error requesting missing arch 'arm' from arm64+x86_64 Fat Mach-O")
+	}
+}
+
+type fatSlice struct {
+	cpu    macho.Cpu
+	subCPU uint32
+	align  uint32
+	data   []byte
+}
+
+func buildUniversalFatMachO(t *testing.T, slices []fatSlice) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.BigEndian, uint32(macho.MagicFat))
+	_ = binary.Write(&buf, binary.BigEndian, uint32(len(slices)))
+
+	// Header = 8 + 20*N; align slices to 16384 (2^14)
+	offset := uint32(16384)
+	type hdrEntry struct {
+		slice  fatSlice
+		offset uint32
+	}
+	entries := make([]hdrEntry, len(slices))
+	for i, s := range slices {
+		alignBytes := uint32(1 << s.align)
+		if rem := offset % alignBytes; rem != 0 {
+			offset += alignBytes - rem
+		}
+		entries[i] = hdrEntry{slice: s, offset: offset}
+		offset += uint32(len(s.data))
+	}
+
+	for _, e := range entries {
+		_ = binary.Write(&buf, binary.BigEndian, uint32(e.slice.cpu))
+		_ = binary.Write(&buf, binary.BigEndian, e.slice.subCPU)
+		_ = binary.Write(&buf, binary.BigEndian, e.offset)
+		_ = binary.Write(&buf, binary.BigEndian, uint32(len(e.slice.data)))
+		_ = binary.Write(&buf, binary.BigEndian, e.slice.align)
+	}
+
+	for _, e := range entries {
+		if uint32(buf.Len()) < e.offset {
+			buf.Write(make([]byte, int(e.offset)-buf.Len()))
+		}
+		buf.Write(e.slice.data)
+	}
+	return buf.Bytes()
 }

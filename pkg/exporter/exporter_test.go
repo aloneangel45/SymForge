@@ -140,4 +140,33 @@ func TestExportAllFormats(t *testing.T) {
 	if !strings.Contains(string(sbomOut), "pkg:golang/golang.org/x/crypto@v0.31.0") || !strings.Contains(string(sbomOut), "pkg:cargo/serde@1.0.215") {
 		t.Fatalf("missing expected purls in SBOM:\n%s", string(sbomOut))
 	}
+
+	// Graphviz DOT & Mermaid call graph exports
+	res.Functions[0].Calls = []uint64{0x140031000}
+	dotOut, err := Export(res, FormatDOT, Options{UserOnly: false, Limit: 20})
+	if err != nil {
+		t.Fatalf("dot export failed: %v", err)
+	}
+	ds := string(dotOut)
+	if !strings.Contains(ds, "digraph SymForgeCallGraph") || !strings.Contains(ds, "fn_140088120 -> fn_140031000;") {
+		t.Fatalf("unexpected DOT output:\n%s", ds)
+	}
+
+	mmdOut, err := Export(res, FormatMermaid, Options{UserOnly: false, Limit: 20})
+	if err != nil {
+		t.Fatalf("mermaid export failed: %v", err)
+	}
+	ms := string(mmdOut)
+	if !strings.Contains(ms, "flowchart LR") || !strings.Contains(ms, "fn_140088120 --> fn_140031000") {
+		t.Fatalf("unexpected Mermaid output:\n%s", ms)
+	}
+
+	// UserOnly graph export omits runtime edge cleanly
+	mmdUser, err := Export(res, FormatMermaid, Options{UserOnly: true, Limit: 20})
+	if err != nil {
+		t.Fatalf("mermaid user-only export failed: %v", err)
+	}
+	if strings.Contains(string(mmdUser), "runtime.gopark") {
+		t.Fatalf("UserOnly=true leaked runtime.gopark into Mermaid graph")
+	}
 }

@@ -31,10 +31,12 @@ Modern cloud daemons, CLI tools, and embedded agents are overwhelmingly written 
 | **Go Non-Null-Terminated `(ptr, len)` String Slicing** | No | No | Plugin | **Yes (Static + Register-Pair ABI)** |
 | **Rust RFC 2603 `v0` (`_R`) + Legacy Demangler** | Partial | No | Partial | **Yes (Pure Go, Cycle-Safe)** |
 | **Stripped Rust `.dep-v0`, `PanicLocation` & Trait VTables** | No | No | No | **Yes** |
-| **Pure-Go `x86_64` & `ARM64` Call Graph + Disassembly** | Disasm only | No | Slow (JVM) | **Yes (`< 100 ms` typical)** |
+| **Native Imports (ELF/PE IAT/Mach-O) & Universal Fat `--arch`** | Partial | No | Yes | **Yes (Pure Go)** |
+| **Pure-Go `x86_64` & `ARM64` Call Graph + BFS Call-Path + Disasm** | Disasm only | No | Slow (JVM) | **Yes (`< 100 ms` typical)** |
+| **Binary Patch Diffing & Behavioral / Go `garble` Triage** | No | No | Plugin | **Yes (`symforge diff` / `scan`)** |
 | **Crypto Constant XREFs (AES / SHA-256 / ChaCha20)** | No | No | Plugin | **Yes** |
-| **Ghidra / IDA / Binary Ninja Rebased Scripts + CycloneDX SBOM** | No | IDAPython | Native | **All 3 + CycloneDX 1.5** |
-| **Headless Native MCP Server (`stdio` + HTTP/SSE)** | No | No | Requires GUI | **Built-in (`symforge mcp`)** |
+| **Ghidra / IDA / Binja / DOT / Mermaid / CycloneDX 1.5** | No | IDAPython | Native | **All 6 Formats** |
+| **Headless Native MCP Server (`stdio` + HTTP/SSE)** | No | No | Requires GUI | **Built-in (11 Tools)** |
 
 ---
 
@@ -153,15 +155,16 @@ $ symforge inspect ./vault_stripped.exe
 
 ```mermaid
 flowchart LR
-    Bin["ELF / PE / Mach-O\n(Thin & Universal Fat)"] --> Loader["pkg/loader\nVA Mapper + Entropy + .pdata"]
+    Bin["ELF / PE / Mach-O\n(Thin & Universal Fat --arch)"] --> Loader["pkg/loader\nVA Mapper + Imports/IAT/Dylibs\nEntropy + .pdata"]
     Loader --> GoRec["pkg/gorecover\npclntab (1.2-1.27+) + buildinfo\nmoduledata + struct/iface types"]
     Loader --> RustRec["pkg/rustrecover\nRFC 2603 v0 + Legacy Demangler\n.dep-v0 SBOM + Panics + VTables"]
-    GoRec --> Xref["pkg/xref\nx86_64 & ARM64 Disasm\nGo String Slicer + Crypto XREFs"]
+    GoRec --> Xref["pkg/xref\nx86_64 & ARM64 Disasm\nGo String Slicer + Crypto + BFS Path"]
     RustRec --> Xref
-    Xref --> Cache["pkg/analyzer\nSHA-256 / MTime Cache"]
+    Xref --> Cache["pkg/analyzer\nSHA-256 / MTime / Arch Cache"]
+    Cache --> Triage["pkg/triage & pkg/diff\nCapability/Garble Scan & Patch Diff"]
     Cache --> CLI["cmd/symforge\nCLI & JSON Output"]
-    Cache --> Export["pkg/exporter\nGhidra / IDA / Binja / CycloneDX"]
-    Cache --> MCP["pkg/mcpserver\nStdio + Streamable HTTP/SSE"]
+    Cache --> Export["pkg/exporter\nGhidra / IDA / Binja / DOT / Mermaid / CycloneDX"]
+    Cache --> MCP["pkg/mcpserver\n11 Tools over Stdio + HTTP/SSE"]
 ```
 
 ---
@@ -197,22 +200,27 @@ symforge mcp --http 127.0.0.1:8085
 ```
 *(Protected by automatic loopback `Host` & `Origin` DNS-rebinding guards.)*
 
-### Exposed MCP Tools (8 Tools)
+### Exposed MCP Tools (11 Tools)
 
 | Tool | Purpose |
 | :--- | :--- |
-| `analyze_binary` | Token-efficient executive forensic summary (format, entropy, Go/Rust toolchain, top user packages, crypto, high-signal strings). |
+| `analyze_binary` | Token-efficient executive forensic summary (format, Fat Mach-O slices, native imports, entropy, Go/Rust toolchain, top user packages, crypto, high-signal strings). |
 | `list_packages_crates` | Browse recovered Go packages & Rust crates filtered by `user`, `dependency`, `stdlib`, or `runtime`. |
 | `search_functions` | Search stripped/recovered functions by name, demangled path, package, or source file. |
 | `inspect_function` | Inspect one function (`name` or `0x...` VA): callers, callees, string/crypto XREFs, and annotated `x86_64`/`ARM64` assembly. |
 | `find_xrefs` | Query URLs, API routes, secret-hygiene candidates, SQL, commands, and AES/SHA-256/ChaCha20 constants with resolved caller names. |
 | `recover_types` | Reconstruct Go `struct` field offsets/tags, Go `interface` method sets, and Rust trait `vtable` layouts. |
 | `demangle_symbols` | Batch-demangle Rust RFC 2603 `v0` (`_R...`) and legacy (`_ZN...E`) symbols in pure Go. |
-| `export_re_script` | Generate Ghidra, IDA Pro, or Binary Ninja recovery scripts, Markdown forensic reports, or CycloneDX 1.5 SBOMs. |
+| `export_re_script` | Generate Ghidra, IDA Pro, or Binary Ninja recovery scripts, **Graphviz DOT / Mermaid** call graphs, Markdown forensic reports, or CycloneDX 1.5 SBOMs. |
+| `diff_binaries` | Patch/version diff two binaries: added/removed/modified functions, packages, Go/Rust deps, native imports, high-signal strings, crypto constants, and risk highlights. |
+| `scan_capabilities` | Pure-Go behavioral capability, network IoC (URL/IPv4/IPv6), secret, UPX/entropy, and **Go `garble` obfuscation** triage. |
+| `trace_call_path` | BFS shortest directed call-graph path between any two functions (by name, substring, or hex VA) with hop-by-hop addresses and categories. |
+
+*(All binary-accepting MCP tools support optional `"arch"` to select a specific Universal/Fat Mach-O slice such as `"arm64"` or `"amd64"`.)*
 
 ---
 
-## Ghidra, IDA Pro, Binary Ninja & SBOM Workflows
+## Ghidra, IDA Pro, Binary Ninja, Visual Call Graphs & SBOM Workflows
 
 Every exported RE script automatically computes the image-base delta (`currentProgram.getImageBase()` / `ida_nalt.get_imagebase()` / `bv.start`) so PIE binaries mapped at custom bases align cleanly:
 
@@ -225,6 +233,10 @@ symforge export ./target.bin --format ida -o restore_ida.py
 
 # Generate a Binary Ninja Python console/headless script
 symforge export ./target.bin --format binja --user-only -o restore_binja.py
+
+# Export clean Graphviz DOT or Mermaid flowchart LR call graphs
+symforge export ./target.bin --format mermaid --user-only --limit 40 -o callgraph.mmd
+symforge export ./target.bin --format dot --user-only --limit 40 -o callgraph.dot
 
 # Emit a standard CycloneDX 1.5 JSON SBOM (pkg:golang/... & pkg:cargo/...)
 symforge export ./target.bin --format sbom -o sbom.cdx.json
@@ -239,14 +251,17 @@ symforge export ./target.bin --format markdown --user-only -o triage_report.md
 
 | Command | Description |
 | :--- | :--- |
-| `symforge inspect <bin>` | Overview of binary format, entropy, Go/Rust metadata, top packages, and crypto tables (`--json`). |
-| `symforge functions <bin>` | List recovered functions with `--user-only`, `--category`, `--package`, `--query`, `--limit`, `--json`. |
-| `symforge fn <bin> <target>` | Deep-dive into a function by name or `0x...` VA with callers, callees, XREFs, and disassembly. |
-| `symforge strings <bin>` | List classified strings (`url`, `api_route`, `secret_candidate`, `sql`, `command`, `filepath`, `all`). |
-| `symforge types <bin>` | Print reconstructed Go `struct` layouts, `interface` methods, and Rust `vtable` descriptors. |
-| `symforge deps <bin>` | List recovered Go modules & Rust crates, or pass `--sbom` for CycloneDX 1.5 JSON. |
+| `symforge inspect <bin>` | Overview of binary format, Fat slices, native imports, entropy, Go/Rust metadata, top packages, and crypto (`--arch`, `--json`). |
+| `symforge functions <bin>` | List recovered functions with `--arch`, `--user-only`, `--category`, `--package`, `--query`, `--limit`, `--json`. |
+| `symforge fn <bin> <target>` | Deep-dive into a function by name or `0x...` VA with callers, callees, XREFs, and disassembly (`--arch`). |
+| `symforge strings <bin>` | List classified strings (`url`, `api_route`, `secret_candidate`, `sql`, `command`, `filepath`, `all`) (`--arch`). |
+| `symforge types <bin>` | Print reconstructed Go `struct` layouts, `interface` methods, and Rust `vtable` descriptors (`--arch`). |
+| `symforge deps <bin>` | List recovered Go modules & Rust crates, or pass `--sbom` for CycloneDX 1.5 JSON (`--arch`). |
 | `symforge demangle [syms...]` | Demangle Rust `v0` and legacy symbols from arguments or `stdin`. |
-| `symforge export <bin>` | Export `ghidra`, `ida`, `binja`, `markdown`, `sbom`, or `json` artifacts (`-f`, `-o`, `--user-only`). |
+| `symforge export <bin>` | Export `ghidra`, `ida`, `binja`, `dot`, `mermaid`, `markdown`, `sbom`, or `json` (`-f`, `-o`, `--user-only`, `--limit`, `--arch`). |
+| `symforge diff <binA> <binB>` | Patch/version diff two binaries: functions, packages, deps, imports, strings, crypto & risk highlights (`--user-only`, `--limit`, `--arch`, `--json`). |
+| `symforge scan <bin>` | Behavioral capability, network IoC (URL/IPv4/IPv6), packer/entropy & Go `garble` obfuscation scan (`--arch`, `--json`). |
+| `symforge path <bin>` | BFS shortest call-graph path (`--from <fnA> --to <fnB> --max-depth 12 --arch --json`). |
 | `symforge mcp` | Start the MCP server on `stdio` (default) or loopback HTTP/SSE (`--http 127.0.0.1:8085`). |
 | `symforge preset <client>` | Configure `claude-code`, `cursor`, `vscode`, `windsurf`, or `zed` (`--workspace`, `--print`). |
 

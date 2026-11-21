@@ -66,4 +66,19 @@ func main() { fmt.Println(RunCheck(AuthHeader{Token: "ok"})) }
 	if out := runCLI("export", sampleBin, "-f", "sbom", "-o", sbomPath); !strings.Contains(out, "Exported sbom") {
 		t.Fatalf("unexpected export output:\n%s", out)
 	}
+	if out := runCLI("export", sampleBin, "-f", "mermaid", "--user-only", "--limit", "15"); !strings.Contains(out, "flowchart LR") {
+		t.Fatalf("unexpected mermaid export output:\n%s", out)
+	}
+	if out := runCLI("export", sampleBin, "-f", "dot", "--user-only", "--limit", "15"); !strings.Contains(out, "digraph SymForgeCallGraph") {
+		t.Fatalf("unexpected dot export output:\n%s", out)
+	}
+	if out := runCLI("scan", sampleBin, "--arch", "arm64"); !strings.Contains(out, "https://auth.symforge.io/") {
+		t.Fatalf("unexpected scan output:\n%s", out)
+	}
+	if out := runCLI("diff", sampleBin, sampleBin, "--user-only"); !strings.Contains(out, "Identical   : true") {
+		t.Fatalf("unexpected diff output:\n%s", out)
+	}
+	if out := runCLI("path", sampleBin, "--from", "main.main", "--to", "RunCheck", "--max-depth", "8"); !strings.Contains(out, "found=true") || !strings.Contains(out, "RunCheck") {
+		t.Fatalf("unexpected path output:\n%s", out)
+	}
 }

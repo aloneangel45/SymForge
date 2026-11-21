@@ -11,7 +11,7 @@ import (
 )
 
 // Version is stamped at build time via -ldflags "-X main.Version=..."
-var Version = "1.0.1"
+var Version = "1.1.0"
 
 func main() {
 	root := newRootCommand()
@@ -27,8 +27,9 @@ func newRootCommand() *cobra.Command {
 		Short: "SymForge — Stripped Go & Rust Binary Forensics, Symbol/Type Recovery & MCP Server",
 		Long: `SymForge recovers stripped Go (pclntab/moduledata/typelinks) and Rust (v0/legacy demangling,
 cargo-auditable SBOM, panic locations, trait vtables) metadata across ELF, PE, and Mach-O
-binaries, builds pure-Go x86_64 & ARM64 call/string/crypto XREF graphs, exports Ghidra/IDA/Binja
-scripts and CycloneDX 1.5 SBOMs, and serves native MCP tools for AI coding agents.`,
+binaries (including Universal Fat slices & native imports), builds pure-Go x86_64 & ARM64
+call/string/crypto XREF graphs, performs patch diffing, behavioral/garble triage, BFS call-path
+tracing, exports Ghidra/IDA/Binja/DOT/Mermaid/CycloneDX artifacts, and serves native MCP tools.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       Version,
@@ -43,6 +44,9 @@ scripts and CycloneDX 1.5 SBOMs, and serves native MCP tools for AI coding agent
 		newDepsCmd(),
 		newDemangleCmd(),
 		newExportCmd(),
+		newDiffCmd(),
+		newScanCmd(),
+		newPathCmd(),
 		newMCPCmd(),
 		newPresetCmd(),
 		newVersionCmd(),

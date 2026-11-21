@@ -5,6 +5,8 @@ import (
 	"debug/macho"
 	"encoding/binary"
 	"fmt"
+	"runtime"
+	"strings"
 
 	"github.com/aloneangel45/symforge/pkg/model"
 )
@@ -26,9 +28,25 @@ func isMachOMagic(data []byte) bool {
 	return false
 }
 
-func loadMachO(path string, data []byte) (*LoadedBinary, error) {
+func machoCPUToArch(cpu macho.Cpu) model.Architecture {
+	switch cpu {
+	case macho.CpuAmd64:
+		return model.ArchX86_64
+	case macho.CpuArm64:
+		return model.ArchARM64
+	case macho.Cpu386:
+		return model.ArchX86
+	case macho.CpuArm:
+		return model.ArchARM
+	default:
+		return model.ArchUnknown
+	}
+}
+
+func loadMachO(path string, data []byte, opts LoadOptions) (*LoadedBinary, error) {
 	isFat := false
 	sliceData := data
+	var availableArches []string
 
 	// Check for Universal Fat Mach-O (0xCAFEBABE big-endian)
 	if binary.BigEndian.Uint32(data[:4]) == macho.MagicFat {
@@ -40,17 +58,50 @@ func loadMachO(path string, data []byte) (*LoadedBinary, error) {
 		if len(ff.Arches) == 0 {
 			return nil, fmt.Errorf("Mach-O Fat binary %s contains zero architecture slices", path)
 		}
-		// Prefer arm64 or x86_64 slice deterministically
-		chosen := ff.Arches[0]
+
+		seenArch := make(map[string]struct{}, len(ff.Arches))
 		for _, a := range ff.Arches {
-			if a.Cpu == macho.CpuArm64 {
-				chosen = a
-				break
+			name := string(machoCPUToArch(a.Cpu))
+			if name == "" || name == string(model.ArchUnknown) {
+				name = strings.ToLower(a.Cpu.String())
 			}
-			if a.Cpu == macho.CpuAmd64 {
-				chosen = a
+			if _, dup := seenArch[name]; !dup {
+				seenArch[name] = struct{}{}
+				availableArches = append(availableArches, name)
 			}
 		}
+
+		var chosen macho.FatArch
+		matched := false
+		if strings.TrimSpace(opts.Arch) != "" {
+			wantArch, ok := NormalizeArch(opts.Arch)
+			if !ok {
+				return nil, fmt.Errorf("unsupported architecture %q for universal Mach-O %s (available: %s)",
+					opts.Arch, path, strings.Join(availableArches, ", "))
+			}
+			for _, a := range ff.Arches {
+				if machoCPUToArch(a.Cpu) == wantArch {
+					chosen = a
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil, fmt.Errorf("architecture %q not found in universal Mach-O %s (available: %s)",
+					opts.Arch, path, strings.Join(availableArches, ", "))
+			}
+		} else {
+			// Default: host architecture if present, else first slice.
+			hostArch, _ := NormalizeArch(runtime.GOARCH)
+			chosen = ff.Arches[0]
+			for _, a := range ff.Arches {
+				if machoCPUToArch(a.Cpu) == hostArch {
+					chosen = a
+					break
+				}
+			}
+		}
+
 		end := uint64(chosen.Offset) + uint64(chosen.Size)
 		if end > uint64(len(data)) {
 			return nil, fmt.Errorf("Mach-O Fat slice exceeds file bounds in %s", path)
@@ -65,21 +116,10 @@ func loadMachO(path string, data []byte) (*LoadedBinary, error) {
 	}
 	defer mf.Close()
 
-	var arch model.Architecture
+	arch := machoCPUToArch(mf.Cpu)
 	ptrSize := 8
-	switch mf.Cpu {
-	case macho.CpuAmd64:
-		arch = model.ArchX86_64
-	case macho.CpuArm64:
-		arch = model.ArchARM64
-	case macho.Cpu386:
-		arch = model.ArchX86
+	if arch == model.ArchX86 || arch == model.ArchARM {
 		ptrSize = 4
-	case macho.CpuArm:
-		arch = model.ArchARM
-		ptrSize = 4
-	default:
-		arch = model.ArchUnknown
 	}
 
 	endian := "little"
@@ -175,6 +215,8 @@ func loadMachO(path string, data []byte) (*LoadedBinary, error) {
 		}
 	}
 
+	imports := extractMachOImports(mf, order)
+
 	format := model.FormatMachO
 	if isFat {
 		format = model.FormatMachOFat
@@ -182,21 +224,129 @@ func loadMachO(path string, data []byte) (*LoadedBinary, error) {
 
 	return &LoadedBinary{
 		Info: model.BinaryInfo{
-			Format:      format,
-			Arch:        arch,
-			Endianness:  endian,
-			PointerSize: ptrSize,
-			EntryPoint:  entryVA,
-			ImageBase:   imageBase,
-			PIE:         (mf.Flags & 0x200000) != 0, // MH_PIE
-			Stripped:    len(syms) <= 4,            // Stripped Mach-O retains only _mh_execute_header or ~1-2 dyld stubs
-			Language:    model.LangNative,
+			Format:          format,
+			Arch:            arch,
+			AvailableArches: availableArches,
+			Endianness:      endian,
+			PointerSize:     ptrSize,
+			EntryPoint:      entryVA,
+			ImageBase:       imageBase,
+			PIE:             (mf.Flags & 0x200000) != 0, // MH_PIE
+			Stripped:        len(syms) <= 4,            // Stripped Mach-O retains only _mh_execute_header or ~1-2 dyld stubs
+			Language:        model.LangNative,
 		},
 		Sections: sections,
 		Symbols:  syms,
+		Imports:  imports,
 		Order:    order,
 		raw:      sliceData,
 	}, nil
+}
+
+func extractMachOImports(mf *macho.File, order binary.ByteOrder) []model.ImportSymbol {
+	const (
+		lcLoadDylib       = 0x0000000c
+		lcLoadWeakDylib   = 0x80000018
+		lcReexportDylib   = 0x8000001f
+		lcLazyLoadDylib   = 0x00000020
+		lcLoadUpwardDylib = 0x80000023
+		mhTwoLevel        = 0x00000080
+	)
+
+	// Preserve exact load-command dylib ordering so two-level namespace ordinals (1..N) map accurately.
+	var dylibs []string
+	for _, ld := range mf.Loads {
+		if dl, ok := ld.(*macho.Dylib); ok && dl.Name != "" {
+			dylibs = append(dylibs, dl.Name)
+			continue
+		}
+		raw := ld.Raw()
+		if len(raw) < 24 {
+			continue
+		}
+		cmd := order.Uint32(raw[:4])
+		if cmd == lcLoadDylib || cmd == lcLoadWeakDylib || cmd == lcReexportDylib || cmd == lcLazyLoadDylib || cmd == lcLoadUpwardDylib {
+			nameOff := order.Uint32(raw[8:12])
+			if int(nameOff) >= 24 && int(nameOff) < len(raw) {
+				s := raw[nameOff:]
+				if idx := bytes.IndexByte(s, 0); idx >= 0 {
+					s = s[:idx]
+				}
+				if len(s) > 0 {
+					dylibs = append(dylibs, string(s))
+				}
+			}
+		}
+	}
+	if stdLibs, err := mf.ImportedLibraries(); err == nil {
+		seen := make(map[string]struct{}, len(dylibs))
+		for _, d := range dylibs {
+			seen[d] = struct{}{}
+		}
+		for _, d := range stdLibs {
+			if d != "" {
+				if _, ok := seen[d]; !ok {
+					dylibs = append(dylibs, d)
+					seen[d] = struct{}{}
+				}
+			}
+		}
+	}
+
+	var imports []model.ImportSymbol
+	seenSym := make(map[string]struct{})
+	seenLibWithSym := make(map[string]struct{})
+	twoLevel := (mf.Flags & mhTwoLevel) != 0
+
+	if mf.Symtab != nil {
+		for _, sym := range mf.Symtab.Syms {
+			if sym.Name == "" {
+				continue
+			}
+			// Undefined external symbol: N_STAB == 0, N_TYPE == N_UNDF (0), N_EXT == 1
+			if (sym.Type&0xe0) != 0 || (sym.Type&0x0e) != 0 || (sym.Type&0x01) == 0 || sym.Sect != 0 {
+				continue
+			}
+			lib := ""
+			if twoLevel {
+				ord := int((sym.Desc >> 8) & 0xff)
+				if ord >= 1 && ord <= len(dylibs) {
+					lib = dylibs[ord-1]
+				}
+			}
+			seenSym[sym.Name] = struct{}{}
+			if lib != "" {
+				seenLibWithSym[lib] = struct{}{}
+			}
+			imports = append(imports, model.ImportSymbol{
+				Library: lib,
+				Name:    sym.Name,
+			})
+		}
+	}
+
+	if stdSyms, err := mf.ImportedSymbols(); err == nil {
+		for _, name := range stdSyms {
+			if name == "" {
+				continue
+			}
+			if _, ok := seenSym[name]; ok {
+				continue
+			}
+			seenSym[name] = struct{}{}
+			imports = append(imports, model.ImportSymbol{
+				Name: name,
+			})
+		}
+	}
+
+	for _, lib := range dylibs {
+		if _, covered := seenLibWithSym[lib]; !covered {
+			imports = append(imports, model.ImportSymbol{Library: lib})
+		}
+	}
+
+	return imports
 }
 
 func parseMachOEntryPoint(mf *macho.File, imageBase, fallback uint64, order binary.ByteOrder) uint64 {

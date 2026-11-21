@@ -142,6 +142,8 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 		}
 	}
 
+	imports := extractELFImports(ef)
+
 	return &LoadedBinary{
 		Info: model.BinaryInfo{
 			Format:      model.FormatELF,
@@ -156,7 +158,63 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 		},
 		Sections: sections,
 		Symbols:  syms,
+		Imports:  imports,
 		Order:    order,
 		raw:      data,
 	}, nil
+}
+
+func extractELFImports(ef *elf.File) []model.ImportSymbol {
+	var imports []model.ImportSymbol
+	seenSym := make(map[string]struct{})
+	seenLibWithSym := make(map[string]struct{})
+
+	if impSyms, err := ef.ImportedSymbols(); err == nil {
+		for _, imp := range impSyms {
+			if imp.Name == "" {
+				continue
+			}
+			seenSym[imp.Name] = struct{}{}
+			if imp.Library != "" {
+				seenLibWithSym[imp.Library] = struct{}{}
+			}
+			imports = append(imports, model.ImportSymbol{
+				Library: imp.Library,
+				Name:    imp.Name,
+			})
+		}
+	}
+
+	// Fallback for undefined dynamic symbols if ImportedSymbols returned partial or errored
+	if dynSyms, err := ef.DynamicSymbols(); err == nil {
+		for _, sym := range dynSyms {
+			if sym.Name == "" || sym.Section != elf.SHN_UNDEF {
+				continue
+			}
+			if _, ok := seenSym[sym.Name]; ok {
+				continue
+			}
+			seenSym[sym.Name] = struct{}{}
+			imports = append(imports, model.ImportSymbol{
+				Name:    sym.Name,
+				Address: sym.Value,
+			})
+		}
+	}
+
+	// Recover DT_NEEDED shared library dependencies
+	if libs, err := ef.ImportedLibraries(); err == nil {
+		for _, lib := range libs {
+			if lib == "" {
+				continue
+			}
+			if _, covered := seenLibWithSym[lib]; !covered {
+				imports = append(imports, model.ImportSymbol{
+					Library: lib,
+				})
+			}
+		}
+	}
+
+	return imports
 }

@@ -170,6 +170,61 @@ func TestHTTPStreamableAndAllTools(t *testing.T) {
 		t.Fatalf("unexpected export_re_script output:\n%s", outExport)
 	}
 
+	outMermaid := callTool("export_re_script", map[string]any{
+		"path":      binPath,
+		"format":    "mermaid",
+		"user_only": true,
+		"limit":     20,
+	})
+	if !strings.Contains(outMermaid, "flowchart LR") {
+		t.Fatalf("unexpected mermaid export_re_script output:\n%s", outMermaid)
+	}
+
+	outDiff := callTool("diff_binaries", map[string]any{
+		"path_a":    binPath,
+		"path_b":    binPath,
+		"user_only": true,
+		"limit":     25,
+	})
+	if !strings.Contains(outDiff, `"identical": true`) {
+		t.Fatalf("unexpected diff_binaries output:\n%s", outDiff)
+	}
+
+	outScan := callTool("scan_capabilities", map[string]any{
+		"path": binPath,
+	})
+	if !strings.Contains(outScan, `"network_iocs"`) || !strings.Contains(outScan, "https://api.symforge.dev/v1/ping") {
+		t.Fatalf("unexpected scan_capabilities output:\n%s", outScan)
+	}
+
+	outPath := callTool("trace_call_path", map[string]any{
+		"path":      binPath,
+		"from":      "main.main",
+		"to":        "DispatchBeacon",
+		"max_depth": 6,
+	})
+	if !strings.Contains(outPath, `"found": true`) || !strings.Contains(outPath, "DispatchBeacon") {
+		t.Fatalf("unexpected trace_call_path output:\n%s", outPath)
+	}
+
+	// Verify tools/list exposes all 11 MCP tools
+	listResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":77,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResp.Body.Close()
+	var listParsed struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&listParsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listParsed.Result.Tools) != 11 {
+		t.Fatalf("expected 11 MCP tools in tools/list, got %d", len(listParsed.Result.Tools))
+	}
+
 	// Verify explicit "id": null produces a response with "id": null (JSON-RPC 2.0 spec)
 	nullIDResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":null,"method":"ping"}`))
 	if err != nil {

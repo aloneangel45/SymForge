@@ -20,11 +20,14 @@ func ExportMarkdown(res *model.AnalysisResult, opts Options) []byte {
 	fmt.Fprintf(&buf, "| **SHA-256** | `%s` |\n", b.SHA256)
 	fmt.Fprintf(&buf, "| **Size** | `%d` bytes |\n", b.SizeBytes)
 	fmt.Fprintf(&buf, "| **Format / Arch** | `%s` / `%s` (%d-bit, %s-endian) |\n", b.Format, b.Arch, b.PointerSize*8, b.Endianness)
+	if len(b.AvailableArches) > 0 {
+		fmt.Fprintf(&buf, "| **Fat Slices** | `%s` |\n", strings.Join(b.AvailableArches, ", "))
+	}
 	fmt.Fprintf(&buf, "| **Language** | `%s` |\n", b.Language)
 	fmt.Fprintf(&buf, "| **Entry Point / Base** | `0x%x` / `0x%x` (PIE: `%v`) |\n", b.EntryPoint, b.ImageBase, b.PIE)
 	fmt.Fprintf(&buf, "| **Stripped / Packed** | Stripped: `%v` / PackedLikely: `%v` (Max Entropy: `%.2f`) |\n", b.Stripped, b.PackedLikely, b.MaxEntropy)
-	fmt.Fprintf(&buf, "| **Recovered Artifacts** | `%d` functions, `%d` packages/crates, `%d` types, `%d` dependencies |\n\n",
-		len(res.Functions), len(res.Packages), len(res.Types), len(res.Dependencies))
+	fmt.Fprintf(&buf, "| **Recovered Artifacts** | `%d` functions, `%d` packages/crates, `%d` types, `%d` deps, `%d` native imports |\n\n",
+		len(res.Functions), len(res.Packages), len(res.Types), len(res.Dependencies), len(res.Imports))
 
 	if res.Go != nil && res.Go.Detected {
 		fmt.Fprintf(&buf, "## 2. Go Runtime & PCLnTab Metadata\n\n")

@@ -5,6 +5,23 @@ All notable changes to **SymForge** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-21
+
+### Added
+- **Native Import / IAT / Dylib Recovery & Universal Fat Mach-O Slice Selection (`pkg/loader`, `pkg/model`, `pkg/analyzer`)**:
+  - Extended `model.AnalysisResult` with `Imports []model.ImportSymbol` (`Library`, `Name`, `Address`) and `model.BinaryInfo` with `AvailableArches []string`.
+  - **ELF**: Recovers `DT_NEEDED` shared libraries and undefined dynamic symbols (`ImportedSymbols()` + `DynamicSymbols()` fallback).
+  - **PE (`PE32`/`PE32+`)**: Pure-Go `IMAGE_DIRECTORY_ENTRY_IMPORT` parser recovering DLL names, API names/ordinals, and IAT virtual addresses with graceful `debug/pe` fallback.
+  - **Mach-O**: Recovers `LC_LOAD_DYLIB` (including weak/reexport/lazy dylibs) and undefined external symbols with two-level namespace dylib ordinal attribution, plus Universal/Fat Mach-O (`0xCAFEBABE`) slice listing and selection (`--arch` CLI flag & MCP `"arch"` parameter, defaulting to host architecture if present else first slice) backed by arch-aware analysis cache keys.
+- **Stripped Binary Patch / Version Diffing (`pkg/diff`, `symforge diff`, MCP `diff_binaries`)**:
+  - Compares two binaries across added/removed/modified functions (size delta, category change, crypto reference deltas), packages, Go/Rust dependencies (added/removed/version-bumped), native imports, high-signal strings, cryptographic constants, and automated risk highlights.
+- **Pure-Go Behavioral Capability, Network IoC & Go `garble` Obfuscation Triage (`pkg/triage`, `symforge scan`, MCP `scan_capabilities`)**:
+  - Structured severity-scored (`critical|high|medium|info`) findings across process execution, network/C2/TLS (with URL, public/private IPv4, and IPv6 extraction), memory injection, anti-debug, persistence, privilege escalation, crypto primitives, hardcoded secrets, UPX/high-entropy sections (`>= 7.0`), and Go `garble` obfuscation heuristics (stripped `BuildInfo`, randomized base64-like package/function tokens, stripped/obfuscated source paths).
+- **BFS Call-Graph Shortest Path & Visual Graph Exports (`pkg/xref/path.go`, `pkg/exporter/graph.go`, `symforge path`, `symforge export -f dot|mermaid`, MCP `trace_call_path`)**:
+  - Breadth-first shortest path (`FindCallPath`) between any two recovered functions (by name, substring, or hex VA) with `--max-depth` (default `12`).
+  - Clean Graphviz DOT (`digraph`) and Mermaid (`flowchart LR`) call-graph exporters with `--user-only` and `--limit` node caps and category styling.
+  - Expanded SymForge MCP server to **11 native tools** with universal `"arch"` support.
+
 ## [1.0.1] - 2026-11-14
 
 ### Fixed
