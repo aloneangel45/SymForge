@@ -11,7 +11,7 @@ import (
 )
 
 // Version is stamped at build time via -ldflags "-X main.Version=..."
-var Version = "1.1.0"
+var Version = "1.1.1"
 
 func main() {
 	root := newRootCommand()

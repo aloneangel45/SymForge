@@ -218,7 +218,7 @@ func (s *Server) executeTool(name string, rawArgs json.RawMessage) (string, bool
 		}
 		limit := clampLimit(args.Limit, 50, 500)
 		cat := strings.ToLower(strings.TrimSpace(args.Category))
-		var out []model.PackageSummary
+		out := make([]model.PackageSummary, 0)
 		for _, p := range res.Packages {
 			if cat != "" && cat != "all" && string(p.Category) != cat {
 				continue
@@ -270,7 +270,7 @@ func (s *Server) executeTool(name string, rawArgs json.RawMessage) (string, bool
 			CryptoRefs []string              `json:"crypto_refs,omitempty"`
 		}
 
-		var matches []compactFunc
+		matches := make([]compactFunc, 0)
 		totalMatched := 0
 		for _, fn := range res.Functions {
 			if cat != "" && cat != "all" && string(fn.Category) != cat {
@@ -377,7 +377,7 @@ func (s *Server) executeTool(name string, rawArgs json.RawMessage) (string, bool
 			return out
 		}
 
-		var cryptoOut []map[string]any
+		cryptoOut := make([]map[string]any, 0)
 		if kind == "crypto" || kind == "high_signal" || kind == "all" {
 			for _, c := range res.Crypto {
 				if q != "" && !strings.Contains(strings.ToLower(c.Name), q) && !strings.Contains(strings.ToLower(c.Algorithm), q) {
@@ -390,10 +390,13 @@ func (s *Server) executeTool(name string, rawArgs json.RawMessage) (string, bool
 					"confidence":    c.Confidence,
 					"referenced_by": resolveCallers(c.ReferencedBy),
 				})
+				if len(cryptoOut) >= limit {
+					break
+				}
 			}
 		}
 
-		var strOut []map[string]any
+		strOut := make([]map[string]any, 0)
 		if kind != "crypto" {
 			for _, st := range res.Strings {
 				if kind == "high_signal" {
@@ -443,7 +446,7 @@ func (s *Server) executeTool(name string, rawArgs json.RawMessage) (string, bool
 		kind := strings.ToLower(strings.TrimSpace(args.Kind))
 		q := strings.ToLower(strings.TrimSpace(args.Query))
 
-		var typesOut []model.RecoveredType
+		typesOut := make([]model.RecoveredType, 0)
 		totalMatched := 0
 		for _, t := range res.Types {
 			if kind != "" && kind != "all" && strings.ToLower(t.Kind) != kind {
@@ -503,9 +506,10 @@ func (s *Server) executeTool(name string, rawArgs json.RawMessage) (string, bool
 		if err != nil {
 			return fmt.Sprintf("export_re_script error: %v", err), true, nil
 		}
+		graphLimit := clampLimit(args.Limit, 60, 500)
 		payload, err := exporter.Export(res, fmtType, exporter.Options{
 			UserOnly: args.UserOnly,
-			Limit:    args.Limit,
+			Limit:    graphLimit,
 		})
 		if err != nil {
 			return fmt.Sprintf("export error: %v", err), true, nil
@@ -612,7 +616,7 @@ func buildExecutiveSummary(res *model.AnalysisResult) map[string]any {
 		}
 	}
 
-	var topPkgs []model.PackageSummary
+	topPkgs := make([]model.PackageSummary, 0)
 	for _, p := range res.Packages {
 		if p.Category == model.CategoryUser || p.Category == model.CategoryDependency {
 			topPkgs = append(topPkgs, p)
@@ -622,7 +626,7 @@ func buildExecutiveSummary(res *model.AnalysisResult) map[string]any {
 		}
 	}
 
-	var notableStrings []map[string]any
+	notableStrings := make([]map[string]any, 0)
 	for _, st := range res.Strings {
 		if st.Kind == model.StringURL || st.Kind == model.StringAPIRoute || st.Kind == model.StringSecretCandidate || st.Kind == model.StringSQL || st.Kind == model.StringCommand {
 			notableStrings = append(notableStrings, map[string]any{
@@ -637,7 +641,7 @@ func buildExecutiveSummary(res *model.AnalysisResult) map[string]any {
 		}
 	}
 
-	var impLibs []string
+	impLibs := make([]string, 0)
 	seenLib := make(map[string]struct{})
 	for _, imp := range res.Imports {
 		if imp.Library != "" {
@@ -648,8 +652,18 @@ func buildExecutiveSummary(res *model.AnalysisResult) map[string]any {
 		}
 	}
 	impPreview := res.Imports
-	if len(impPreview) > 25 {
+	if impPreview == nil {
+		impPreview = make([]model.ImportSymbol, 0)
+	} else if len(impPreview) > 25 {
 		impPreview = impPreview[:25]
+	}
+	cryptoDet := res.Crypto
+	if cryptoDet == nil {
+		cryptoDet = make([]model.CryptoDetection, 0)
+	}
+	sections := res.Sections
+	if sections == nil {
+		sections = make([]model.SectionInfo, 0)
 	}
 
 	return map[string]any{
@@ -657,7 +671,7 @@ func buildExecutiveSummary(res *model.AnalysisResult) map[string]any {
 		"go":                   res.Go,
 		"rust":                 res.Rust,
 		"section_count":        len(res.Sections),
-		"sections":             res.Sections,
+		"sections":             sections,
 		"imports_count":        len(res.Imports),
 		"imported_libraries":   impLibs,
 		"imports_preview":      impPreview,
@@ -667,7 +681,7 @@ func buildExecutiveSummary(res *model.AnalysisResult) map[string]any {
 		"recovered_types":      len(res.Types),
 		"dependencies":         len(res.Dependencies),
 		"panic_locations":      len(res.Panics),
-		"crypto_detections":    res.Crypto,
+		"crypto_detections":    cryptoDet,
 		"top_packages":         topPkgs,
 		"high_signal_strings":  notableStrings,
 		"analysis_duration_ms": res.AnalysisDurationMs,

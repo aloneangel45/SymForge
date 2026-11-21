@@ -5,6 +5,25 @@ All notable changes to **SymForge** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-11-21
+
+### Fixed
+- **PE / ELF / Mach-O Loader Bounds, Overflow & DoS Hardening (`pkg/loader`, `pkg/analyzer`)**:
+  - Added checked `uint64` arithmetic across PE `IMAGE_DIRECTORY_ENTRY_IMPORT`, `.pdata`, section/symbol VAs, and Mach-O `LC_MAIN` entry points; fixed zero-`entryRVA` PE DLLs reporting `ImageBase` as `EntryPoint`.
+  - Bounded PE import directory parsing by `importDir.Size`, descriptor/thunk/total-import caps (`1024`/`8192`/`65536`), and visited `(lookupRVA, firstThunk)` deduplication to prevent circular/repeated descriptor DoS; added PE32+ upper-bit guard (`thunk >> 31 != 0`) to skip bound/corrupted 64-bit IAT pointers, INT-to-IAT fallback, and printable-ASCII validation for truncated/corrupted import strings.
+  - Fixed a `uint64` wraparound slice-bounds panic in stripped 0-section ELF `PT_LOAD` fallback (`p.Off + p.Filesz`) and guarded reserved ELF symbol section indices (`>= SHN_LORESERVE`).
+  - Improved Universal Fat Mach-O architecture handling: added `x86_64h` alias, preferred exact `arm64e` subcpu slice (`CPU_SUBTYPE_ARM64E`) when requested, and routed unknown `--arch` validation through `loadMachO` so Fat Mach-O errors always list `AvailableArches`.
+  - Hardened `analyzer.Engine` cache keys with `MinStringLen`, `MaxStrings`, `arm64e` distinction, and SHA-256 recency verification (`< 2s`) so rapid same-size same-mtime in-place file overwrites never serve stale cached analysis.
+- **Deterministic Duplicate-Function Binary Diffing (`pkg/diff`)**:
+  - Replaced flat `map[string]Function` indexing with grouped deterministic multi-pass matching (preserving duplicate Go `init`/closures, Rust monomorphizations, and stripped symbols) and accurate `FunctionsA`/`FunctionsB` counts.
+  - Fixed Fat Mach-O cross-arch diff falsely reporting `Identical=true` on matching file SHA-256, fixed case-sensitive sorting in `stringSlicesEqualFold`, and tightened sensitive API risk highlights (`system`, `popen`, `ptrace`, `mprotect` exact matching so benign APIs like `GetSystemInfo` do not false-positive).
+- **Behavioral Triage & Go `garble` False-Positive & Deduplication Hardening (`pkg/triage`)**:
+  - Deduplicated native import findings case-insensitively by `dll!symbol` (fixing `KERNEL32.DLL` vs `kernel32.dll` double-counting and consistent `formatImport` in memory injection), deduplicated secret candidates by value, and clamped entropy (`[0.0, 8.0]`) and scores (`[0, 100]`).
+  - Eliminated false positives on benign Go/Rust binaries: removed substring `"popen"` matching (`httpopen`), rejected pure-alpha 2-colon Rust namespaces (`aead::aead`, `de::de`) as IPv6 IoCs, hardened `isGarbleToken` against CamelCase crypto/net names (`NewAES256GCM`, `SignEd25519Key`, `VerifyPKCS1v15`, `DecodeBase64URL`, `ParseIPv4Addr`), and prevented `GarbleLikely=true` when recovered user/dep symbols contain zero garbled identifiers.
+- **Graph Exporter Escaping, Call-Path Validation & MCP Limits (`pkg/exporter`, `pkg/xref`, `pkg/mcpserver`, `cmd/symforge`)**:
+  - Hardened Graphviz DOT and Mermaid `flowchart LR` escaping against Go/Rust punctuation (`(*Type).Method`, `Vec<&mut [u8]>::{{closure}}`, `"`, `` ` ``, `\`, `[`, `]`, `{`, `}`, `<`, `>`, `|`, `;`, `#`, control chars), deduplicated duplicate-entry nodes, and added nil guards.
+  - Guarded `FindCallPath` against zero-entry function collisions and excessive depths (`MaxPathDepth = 128`), added CLI `--max-depth <= 0` validation on `symforge path`, clamped `export_re_script` graph limits (`<= 500`) and `find_xrefs` crypto results in MCP, and initialized empty JSON collections as `[]` instead of `null`.
+
 ## [1.1.0] - 2026-11-21
 
 ### Added

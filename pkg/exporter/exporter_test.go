@@ -170,3 +170,112 @@ func TestExportAllFormats(t *testing.T) {
 		t.Fatalf("UserOnly=true leaked runtime.gopark into Mermaid graph")
 	}
 }
+
+func TestGraphExportDOTAndMermaidEscapingHardening(t *testing.T) {
+	// Nil safety
+	if got := ExportDOT(nil, Options{}); got != nil {
+		t.Fatalf("expected nil from ExportDOT(nil), got %q", string(got))
+	}
+	if got := ExportMermaid(nil, Options{}); got != nil {
+		t.Fatalf("expected nil from ExportMermaid(nil), got %q", string(got))
+	}
+
+	res := &model.AnalysisResult{
+		Binary: model.BinaryInfo{
+			Path:   "/tmp/evil\"path\n%%inject\\bin",
+			Format: model.FormatELF,
+			Arch:   model.ArchX86_64,
+		},
+		Functions: []model.Function{
+			{
+				Name:     "github.com/org/repo/pkg.(*Client[string]).Do\"Quote\"\nInject",
+				Category: model.CategoryUser,
+				Entry:    0x401000,
+				Calls:    []uint64{0x402000, 0x403000},
+			},
+			// Duplicate Entry should be deduplicated cleanly
+			{
+				Name:     "duplicate_entry_ignored",
+				Category: model.CategoryUser,
+				Entry:    0x401000,
+			},
+			{
+				Name:      "_RNvCs_vec",
+				Demangled: "alloc::vec::Vec<&mut [u8]>::{{closure}}",
+				Category:  model.CategoryDependency,
+				Entry:     0x402000,
+				Calls:     []uint64{0x403000},
+			},
+			{
+				Name:     "main.func1.1 | pipe; semi #1 `tick` [arr] (arg)",
+				Category: model.CategoryUser,
+				Entry:    0x403000,
+			},
+		},
+	}
+
+	// 1. Graphviz DOT verification
+	dotBytes := ExportDOT(res, Options{Limit: 20})
+	dotStr := string(dotBytes)
+	if strings.Count(dotStr, "fn_401000 [label=") != 1 {
+		t.Fatalf("expected deduplicated single DOT node for fn_401000:\n%s", dotStr)
+	}
+	// Every node line must have balanced unescaped quotes and no raw control chars/newlines inside label
+	for _, line := range strings.Split(dotStr, "\n") {
+		if strings.Contains(line, "[label=\"") {
+			unescapedQuotes := 0
+			for i := 0; i < len(line); i++ {
+				if line[i] == '"' {
+					bs := 0
+					for j := i - 1; j >= 0 && line[j] == '\\'; j-- {
+						bs++
+					}
+					if bs%2 == 0 {
+						unescapedQuotes++
+					}
+				}
+			}
+			if unescapedQuotes%2 != 0 {
+				t.Fatalf("unbalanced DOT quotes on line: %s", line)
+			}
+		}
+	}
+	if !strings.Contains(dotStr, `\"Quote\"`) {
+		t.Fatalf("expected escaped quotes in DOT output:\n%s", dotStr)
+	}
+
+	// 2. Mermaid verification
+	mmdBytes := ExportMermaid(res, Options{Limit: 20})
+	mmdStr := string(mmdBytes)
+	if strings.Count(mmdStr, "fn_401000[") != 1 {
+		t.Fatalf("expected deduplicated single Mermaid node for fn_401000:\n%s", mmdStr)
+	}
+	// Verify header comment didn't inject a second line
+	lines := strings.Split(mmdStr, "\n")
+	if len(lines) < 2 || !strings.HasPrefix(lines[1], "  %% SymForge Call Graph:") || strings.Contains(lines[2], "inject") {
+		t.Fatalf("Mermaid comment newline injection detected:\n%s", mmdStr)
+	}
+	// Inspect every Mermaid node label inside fn_<hex>["..."]:::cls
+	for _, line := range lines {
+		trim := strings.TrimSpace(line)
+		if !strings.HasPrefix(trim, "fn_") || !strings.Contains(trim, "[\"") {
+			continue
+		}
+		start := strings.Index(trim, "[\"") + 2
+		end := strings.LastIndex(trim, "\"]:::")
+		if end <= start {
+			t.Fatalf("malformed Mermaid node line: %s", line)
+		}
+		label := trim[start:end]
+		for _, forbidden := range []string{`"`, "`", "[", "]", "{", "}", "<", ">", "|"} {
+			if strings.Contains(label, forbidden) {
+				t.Errorf("unescaped hazardous Mermaid char %q in label %q", forbidden, label)
+			}
+		}
+	}
+	for _, wantEntity := range []string{"&amp;", "&lt;", "&gt;", "&quot;", "&#123;&#123;closure&#125;&#125;", "&#124;", "&#59;", "&#91;", "&#93;", "&#96;", "&#35;"} {
+		if !strings.Contains(mmdStr, wantEntity) {
+			t.Errorf("expected Mermaid entity %q in output:\n%s", wantEntity, mmdStr)
+		}
+	}
+}

@@ -58,22 +58,20 @@ func loadPE(path string, data []byte) (*LoadedBinary, error) {
 
 	var sections []model.SectionInfo
 	for _, s := range pf.Sections {
-		va := imageBase + uint64(s.VirtualAddress)
+		va, ok := addU64Checked(imageBase, uint64(s.VirtualAddress))
+		if !ok {
+			continue
+		}
 		vsize := uint64(s.VirtualSize)
 		fOff := uint64(s.Offset)
 		fSize := uint64(s.Size)
 		var secBytes []byte
 		if fSize > 0 && fOff < uint64(len(data)) {
-			end := fOff + fSize
-			if end > uint64(len(data)) {
-				end = uint64(len(data))
+			avail := uint64(len(data)) - fOff
+			if fSize > avail {
+				fSize = avail
 			}
-			if end > fOff {
-				secBytes = data[fOff:end]
-				fSize = end - fOff
-			} else {
-				fSize = 0
-			}
+			secBytes = data[fOff : fOff+fSize]
 		} else {
 			fSize = 0
 		}
@@ -99,12 +97,23 @@ func loadPE(path string, data []byte) (*LoadedBinary, error) {
 			continue
 		}
 		sec := pf.Sections[sym.SectionNumber-1]
-		addr := imageBase + uint64(sec.VirtualAddress) + uint64(sym.Value)
+		secVA, ok1 := addU64Checked(imageBase, uint64(sec.VirtualAddress))
+		addr, ok2 := addU64Checked(secVA, uint64(sym.Value))
+		if !ok1 || !ok2 {
+			continue
+		}
 		syms = append(syms, model.SymbolEntry{
 			Name:    sym.Name,
 			Addr:    addr,
 			Section: sec.Name,
 		})
+	}
+
+	var entryPoint uint64
+	if entryRVA != 0 {
+		if ep, ok := addU64Checked(imageBase, uint64(entryRVA)); ok {
+			entryPoint = ep
+		}
 	}
 
 	lb := &LoadedBinary{
@@ -113,7 +122,7 @@ func loadPE(path string, data []byte) (*LoadedBinary, error) {
 			Arch:        arch,
 			Endianness:  "little",
 			PointerSize: ptrSize,
-			EntryPoint:  imageBase + uint64(entryRVA),
+			EntryPoint:  entryPoint,
 			ImageBase:   imageBase,
 			PIE:         pie,
 			Stripped:    len(syms) == 0,
@@ -151,87 +160,145 @@ func extractPEImports(pf *pe.File, lb *LoadedBinary, imageBase uint64, ptrSize i
 
 	var imports []model.ImportSymbol
 	if importDir.VirtualAddress != 0 && (ptrSize == 4 || ptrSize == 8) {
-		dirVA := imageBase + uint64(importDir.VirtualAddress)
-		const maxDescriptors = 2048
-		const maxThunksPerDLL = 16384
+		if dirVA, ok := addU64Checked(imageBase, uint64(importDir.VirtualAddress)); ok {
+			const (
+				maxDescriptors  = 1024
+				maxThunksPerDLL = 8192
+				maxTotalImports = 65536
+			)
 
-		for i := 0; i < maxDescriptors; i++ {
-			desc, ok := lb.ReadAtVA(dirVA+uint64(i)*20, 20)
-			if !ok {
-				break
-			}
-			origFirstThunk := binary.LittleEndian.Uint32(desc[0:4])
-			nameRVA := binary.LittleEndian.Uint32(desc[12:16])
-			firstThunk := binary.LittleEndian.Uint32(desc[16:20])
-			if origFirstThunk == 0 && nameRVA == 0 && firstThunk == 0 {
-				break
-			}
-
-			dllName := ""
-			if nameRVA != 0 {
-				if s, ok := lb.ReadCStringAtVA(imageBase+uint64(nameRVA), 260); ok {
-					dllName = s
+			descLimit := maxDescriptors
+			if importDir.Size > 0 {
+				bySize := int(importDir.Size / 20)
+				if bySize < descLimit {
+					descLimit = bySize
 				}
 			}
 
-			lookupRVA := origFirstThunk
-			if lookupRVA == 0 {
-				lookupRVA = firstThunk
+			type thunkTableKey struct {
+				lookupRVA  uint32
+				firstThunk uint32
 			}
-			addedForDLL := 0
-			if lookupRVA != 0 {
-				lookupVA := imageBase + uint64(lookupRVA)
-				for idx := 0; idx < maxThunksPerDLL; idx++ {
-					thunkBytes, ok := lb.ReadAtVA(lookupVA+uint64(idx)*uint64(ptrSize), ptrSize)
-					if !ok {
-						break
-					}
-					var thunk uint64
-					var isOrdinal bool
-					var hintNameRVA uint64
-					if ptrSize == 8 {
-						thunk = binary.LittleEndian.Uint64(thunkBytes)
-						if thunk == 0 {
-							break
-						}
-						isOrdinal = (thunk & (uint64(1) << 63)) != 0
-						hintNameRVA = thunk & 0x7fffffff
-					} else {
-						t32 := binary.LittleEndian.Uint32(thunkBytes)
-						if t32 == 0 {
-							break
-						}
-						thunk = uint64(t32)
-						isOrdinal = (t32 & 0x80000000) != 0
-						hintNameRVA = uint64(t32 & 0x7fffffff)
-					}
+			seenTables := make(map[thunkTableKey]struct{})
 
-					var symName string
-					if isOrdinal {
-						symName = fmt.Sprintf("Ordinal#%d", thunk&0xffff)
-					} else if hintNameRVA != 0 {
-						// IMAGE_IMPORT_BY_NAME: 2-byte Hint followed by null-terminated ASCII name
-						if name, ok := lb.ReadCStringAtVA(imageBase+hintNameRVA+2, 512); ok {
-							symName = name
+			for i := 0; i < descLimit && len(imports) < maxTotalImports; i++ {
+				descVA, ok := addU64Checked(dirVA, uint64(i)*20)
+				if !ok {
+					break
+				}
+				desc, ok := lb.ReadAtVA(descVA, 20)
+				if !ok {
+					break
+				}
+				origFirstThunk := binary.LittleEndian.Uint32(desc[0:4])
+				nameRVA := binary.LittleEndian.Uint32(desc[12:16])
+				firstThunk := binary.LittleEndian.Uint32(desc[16:20])
+				if origFirstThunk == 0 && nameRVA == 0 && firstThunk == 0 {
+					break
+				}
+
+				dllName := ""
+				if nameRVA != 0 {
+					if nameVA, ok := addU64Checked(imageBase, uint64(nameRVA)); ok {
+						if s, ok := lb.ReadCStringAtVA(nameVA, 260); ok && isPrintableASCII(s) {
+							dllName = s
 						}
 					}
-					if symName == "" && dllName == "" {
-						continue
-					}
-					var iatAddr uint64
-					if firstThunk != 0 {
-						iatAddr = imageBase + uint64(firstThunk) + uint64(idx)*uint64(ptrSize)
-					}
-					imports = append(imports, model.ImportSymbol{
-						Library: dllName,
-						Name:    symName,
-						Address: iatAddr,
-					})
-					addedForDLL++
 				}
-			}
-			if addedForDLL == 0 && dllName != "" {
-				imports = append(imports, model.ImportSymbol{Library: dllName})
+
+				lookupRVA := origFirstThunk
+				if lookupRVA == 0 {
+					lookupRVA = firstThunk
+				} else if firstThunk != 0 && firstThunk != origFirstThunk {
+					if checkVA, ok := addU64Checked(imageBase, uint64(lookupRVA)); !ok || !lb.IsReadableVA(checkVA) {
+						lookupRVA = firstThunk
+					}
+				}
+
+				addedForDLL := 0
+				if lookupRVA != 0 {
+					tKey := thunkTableKey{lookupRVA: lookupRVA, firstThunk: firstThunk}
+					if _, dup := seenTables[tKey]; !dup {
+						seenTables[tKey] = struct{}{}
+						if lookupVA, ok := addU64Checked(imageBase, uint64(lookupRVA)); ok {
+							for idx := 0; idx < maxThunksPerDLL && len(imports) < maxTotalImports; idx++ {
+								slotVA, ok := addU64Checked(lookupVA, uint64(idx)*uint64(ptrSize))
+								if !ok {
+									break
+								}
+								thunkBytes, ok := lb.ReadAtVA(slotVA, ptrSize)
+								if !ok {
+									break
+								}
+								var thunk uint64
+								var isOrdinal bool
+								var hintNameRVA uint64
+								if ptrSize == 8 {
+									thunk = binary.LittleEndian.Uint64(thunkBytes)
+									if thunk == 0 {
+										break
+									}
+									isOrdinal = (thunk & (uint64(1) << 63)) != 0
+									if !isOrdinal {
+										// PE32+ IMAGE_THUNK_DATA64 reserves bits 31..62 as 0 for RVA entries;
+										// non-zero upper bits indicate a bound IAT pointer or corrupted thunk.
+										if (thunk >> 31) != 0 {
+											continue
+										}
+										hintNameRVA = thunk & 0x7fffffff
+									}
+								} else {
+									t32 := binary.LittleEndian.Uint32(thunkBytes)
+									if t32 == 0 {
+										break
+									}
+									thunk = uint64(t32)
+									isOrdinal = (t32 & 0x80000000) != 0
+									hintNameRVA = uint64(t32 & 0x7fffffff)
+								}
+
+								var symName string
+								if isOrdinal {
+									symName = fmt.Sprintf("Ordinal#%d", thunk&0xffff)
+								} else if hintNameRVA != 0 {
+									// IMAGE_IMPORT_BY_NAME: 2-byte Hint followed by null-terminated ASCII name
+									if hintVA, ok := addU64Checked(imageBase, hintNameRVA); ok {
+										if _, ok := lb.ReadAtVA(hintVA, 2); ok {
+											if strVA, ok := addU64Checked(hintVA, 2); ok {
+												if name, ok := lb.ReadCStringAtVA(strVA, 512); ok && isPrintableASCII(name) {
+													symName = name
+												}
+											}
+										}
+									}
+								}
+								if symName == "" && dllName == "" {
+									continue
+								}
+								if symName == "" {
+									continue
+								}
+								var iatAddr uint64
+								if firstThunk != 0 {
+									if ftBase, ok := addU64Checked(imageBase, uint64(firstThunk)); ok {
+										if addr, ok := addU64Checked(ftBase, uint64(idx)*uint64(ptrSize)); ok {
+											iatAddr = addr
+										}
+									}
+								}
+								imports = append(imports, model.ImportSymbol{
+									Library: dllName,
+									Name:    symName,
+									Address: iatAddr,
+								})
+								addedForDLL++
+							}
+						}
+					}
+				}
+				if addedForDLL == 0 && dllName != "" && len(imports) < maxTotalImports {
+					imports = append(imports, model.ImportSymbol{Library: dllName})
+				}
 			}
 		}
 	}
@@ -280,9 +347,11 @@ func extractPEPDataX64(pf *pe.File, lb *LoadedBinary, imageBase uint64) []model.
 		// IMAGE_DIRECTORY_ENTRY_EXCEPTION = index 3
 		if len(opt.DataDirectory) > 3 {
 			dir := opt.DataDirectory[3]
-			if dir.VirtualAddress > 0 && dir.Size >= 12 {
-				if raw, ok := lb.ReadAtVA(imageBase+uint64(dir.VirtualAddress), int(dir.Size)); ok {
-					pdataBytes = raw
+			if dir.VirtualAddress > 0 && dir.Size >= 12 && uint64(dir.Size) <= uint64(len(lb.raw)) {
+				if dirVA, ok := addU64Checked(imageBase, uint64(dir.VirtualAddress)); ok {
+					if raw, ok := lb.ReadAtVA(dirVA, int(dir.Size)); ok {
+						pdataBytes = raw
+					}
 				}
 			}
 		}
@@ -304,8 +373,11 @@ func extractPEPDataX64(pf *pe.File, lb *LoadedBinary, imageBase uint64) []model.
 		if beginRVA == 0 || endRVA <= beginRVA {
 			continue
 		}
-		startVA := imageBase + uint64(beginRVA)
-		endVA := imageBase + uint64(endRVA)
+		startVA, ok1 := addU64Checked(imageBase, uint64(beginRVA))
+		endVA, ok2 := addU64Checked(imageBase, uint64(endRVA))
+		if !ok1 || !ok2 {
+			continue
+		}
 		if !lb.IsCodeVA(startVA) {
 			continue
 		}

@@ -73,17 +73,30 @@ func loadMachO(path string, data []byte, opts LoadOptions) (*LoadedBinary, error
 
 		var chosen macho.FatArch
 		matched := false
-		if strings.TrimSpace(opts.Arch) != "" {
-			wantArch, ok := NormalizeArch(opts.Arch)
+		rawArch := strings.ToLower(strings.TrimSpace(opts.Arch))
+		if rawArch != "" {
+			wantArch, ok := NormalizeArch(rawArch)
 			if !ok {
 				return nil, fmt.Errorf("unsupported architecture %q for universal Mach-O %s (available: %s)",
 					opts.Arch, path, strings.Join(availableArches, ", "))
 			}
-			for _, a := range ff.Arches {
-				if machoCPUToArch(a.Cpu) == wantArch {
-					chosen = a
-					matched = true
-					break
+			// If user explicitly requested arm64e, prefer an arm64e subcpu slice (CPU_SUBTYPE_ARM64E = 2) when present.
+			if rawArch == "arm64e" {
+				for _, a := range ff.Arches {
+					if a.Cpu == macho.CpuArm64 && (a.SubCpu&0x00ffffff) == 2 {
+						chosen = a
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				for _, a := range ff.Arches {
+					if machoCPUToArch(a.Cpu) == wantArch {
+						chosen = a
+						matched = true
+						break
+					}
 				}
 			}
 			if !matched {
@@ -151,16 +164,11 @@ func loadMachO(path string, data []byte, opts LoadOptions) (*LoadedBinary, error
 		var secBytes []byte
 		// Zerofill sections (S_ZEROFILL = 0x1) have Offset == 0 and no backing bytes
 		if (s.Flags&0xff) != 0x1 && fSize > 0 && fOff < uint64(len(sliceData)) {
-			end := fOff + fSize
-			if end > uint64(len(sliceData)) {
-				end = uint64(len(sliceData))
+			avail := uint64(len(sliceData)) - fOff
+			if fSize > avail {
+				fSize = avail
 			}
-			if end > fOff {
-				secBytes = sliceData[fOff:end]
-				fSize = end - fOff
-			} else {
-				fSize = 0
-			}
+			secBytes = sliceData[fOff : fOff+fSize]
 		} else {
 			fSize = 0
 		}
@@ -356,7 +364,9 @@ func parseMachOEntryPoint(mf *macho.File, imageBase, fallback uint64, order bina
 		raw := ld.Raw()
 		if len(raw) >= 16 && order.Uint32(raw[:4]) == lcMain {
 			entryOff := order.Uint64(raw[8:16])
-			return imageBase + entryOff
+			if va, ok := addU64Checked(imageBase, entryOff); ok {
+				return va
+			}
 		}
 	}
 	return fallback

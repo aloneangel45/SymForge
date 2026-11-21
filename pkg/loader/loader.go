@@ -43,7 +43,7 @@ func NormalizeArch(raw string) (model.Architecture, bool) {
 	switch s {
 	case "":
 		return "", true
-	case "amd64", "x86_64", "x86-64", "x64":
+	case "amd64", "x86_64", "x86-64", "x64", "x86_64h":
 		return model.ArchX86_64, true
 	case "arm64", "aarch64", "arm64e":
 		return model.ArchARM64, true
@@ -91,15 +91,6 @@ func LoadBytesWithOptions(path string, data []byte, opts LoadOptions) (*LoadedBi
 		return nil, fmt.Errorf("file %s too small to be a valid executable (%d bytes)", path, len(data))
 	}
 
-	var wantArch model.Architecture
-	if strings.TrimSpace(opts.Arch) != "" {
-		norm, ok := NormalizeArch(opts.Arch)
-		if !ok {
-			return nil, fmt.Errorf("unsupported architecture %q (expected x86_64/amd64, arm64, x86, or arm)", opts.Arch)
-		}
-		wantArch = norm
-	}
-
 	sum := sha256.Sum256(data)
 	shaHex := hex.EncodeToString(sum[:])
 
@@ -122,8 +113,14 @@ func LoadBytesWithOptions(path string, data []byte, opts LoadOptions) (*LoadedBi
 		return nil, err
 	}
 
-	if wantArch != "" && lb.Info.Format != model.FormatMachOFat && lb.Info.Arch != wantArch {
-		return nil, fmt.Errorf("requested architecture %q does not match binary architecture %q in %s", opts.Arch, lb.Info.Arch, path)
+	if strings.TrimSpace(opts.Arch) != "" && lb.Info.Format != model.FormatMachOFat {
+		wantArch, ok := NormalizeArch(opts.Arch)
+		if !ok {
+			return nil, fmt.Errorf("unsupported architecture %q (expected x86_64/amd64, arm64, x86, or arm)", opts.Arch)
+		}
+		if lb.Info.Arch != wantArch {
+			return nil, fmt.Errorf("requested architecture %q does not match binary architecture %q in %s", opts.Arch, lb.Info.Arch, path)
+		}
 	}
 
 	lb.Info.Path = path
@@ -445,4 +442,25 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// addU64Checked computes a + b and returns false on uint64 wraparound.
+func addU64Checked(a, b uint64) (uint64, bool) {
+	if a > ^uint64(0)-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+// isPrintableASCII reports whether s is non-empty and consists strictly of printable ASCII bytes (0x20..0x7e).
+func isPrintableASCII(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }

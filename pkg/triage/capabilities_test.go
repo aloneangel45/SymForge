@@ -1,6 +1,8 @@
 package triage
 
 import (
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/aloneangel45/symforge/pkg/model"
@@ -157,5 +159,97 @@ func TestGarbleObfuscationDetectionVsCleanGoBinary(t *testing.T) {
 	}
 	if cRep.Obfuscation.GarbleLikely {
 		t.Fatalf("normal stripped Go binary falsely flagged as garble: %+v", cRep.Obfuscation)
+	}
+}
+
+func TestTriageHardeningFalsePositivesAndDeduplication(t *testing.T) {
+	// 1. Verify normal Go crypto/network identifiers do NOT trigger isGarbleToken
+	benignNames := []string{
+		"NewAES256GCM", "SignEd25519Key", "VerifyPKCS1v15",
+		"DecodeBase64URL", "ParseIPv4Addr", "GetJSONByID",
+		"NewHTTPClientV2", "SHA256Sum", "TLS13Handshake",
+	}
+	for _, name := range benignNames {
+		if isGarbleToken(name) {
+			t.Errorf("isGarbleToken(%q) = true, want false (false positive on normal Go identifier)", name)
+		}
+	}
+
+	// 2. Clean Go binary with stripped BuildInfo & missing source paths but readable user symbols must NOT be GarbleLikely
+	strippedCleanGo := &model.AnalysisResult{
+		Binary: model.BinaryInfo{Path: "stripped_clean", Format: model.FormatELF, Arch: model.ArchX86_64, Language: model.LangGo},
+		Go:     &model.GoMetadata{Detected: true, Version: ""}, // BuildInfo & Version stripped
+		Packages: []model.PackageSummary{
+			{Name: "main", Category: model.CategoryUser, FunctionCount: 5},
+			{Name: "crypto/custom", Category: model.CategoryUser, FunctionCount: 2},
+		},
+		Functions: []model.Function{
+			{Name: "main.main", Package: "main", Category: model.CategoryUser},
+			{Name: "main.NewAES256GCM", Package: "main", Category: model.CategoryUser},
+			{Name: "main.VerifyPKCS1v15", Package: "main", Category: model.CategoryUser},
+			{Name: "main.SignEd25519Key", Package: "main", Category: model.CategoryUser},
+			{Name: "main.DecodeBase64URL", Package: "main", Category: model.CategoryUser},
+			{Name: "runtime.gopark", Package: "runtime", Category: model.CategoryRuntime},
+			{Name: "runtime.mallocgc", Package: "runtime", Category: model.CategoryRuntime},
+			{Name: "runtime.schedule", Package: "runtime", Category: model.CategoryRuntime},
+			{Name: "runtime.mstart", Package: "runtime", Category: model.CategoryRuntime},
+			{Name: "runtime.newproc", Package: "runtime", Category: model.CategoryRuntime},
+		},
+		Sections: []model.SectionInfo{
+			{Name: ".bad_nan", FileSize: 4096, Entropy: math.NaN()},
+			{Name: ".bad_neg", FileSize: 4096, Entropy: -3.5},
+			{Name: ".bad_hi", FileSize: 4096, Entropy: 12.9}, // must clamp to 8.0
+		},
+		Imports: []model.ImportSymbol{
+			// Mixed-case duplicate DLL imports must deduplicate case-insensitively!
+			{Library: "KERNEL32.DLL", Name: "CreateProcessW", Address: 0x1000},
+			{Library: "kernel32.dll", Name: "CreateProcessW", Address: 0x1008},
+			// Benign "httpopen" must NOT falsely match "popen"
+			{Library: "libnet.so", Name: "httpopen", Address: 0x2000},
+		},
+		Strings: []model.ExtractedString{
+			// Rust/C++ hex-word namespaces must NOT be falsely extracted as IPv6 IoCs
+			{Value: "error in aead::aead and de::de and bad::cab", Kind: model.StringGeneral, Addr: 0x3000},
+			// Duplicate secret strings at multiple addresses must deduplicate
+			{Value: "AKIAIOSFODNN7EXAMPLE", Kind: model.StringSecretCandidate, Addr: 0x4000},
+			{Value: "AKIAIOSFODNN7EXAMPLE", Kind: model.StringSecretCandidate, Addr: 0x4100},
+		},
+	}
+
+	rep, err := Scan(strippedCleanGo)
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+	if rep.Obfuscation.GarbleLikely {
+		t.Fatalf("clean Go binary with readable symbols falsely flagged GarbleLikely: %+v", rep.Obfuscation)
+	}
+	if rep.Obfuscation.GarbleScore < 0 || rep.Obfuscation.GarbleScore > 45 {
+		t.Errorf("expected GarbleScore in [0, 45], got %d", rep.Obfuscation.GarbleScore)
+	}
+	if rep.RiskScore < 0 || rep.RiskScore > 100 {
+		t.Errorf("RiskScore out of [0,100] bounds: %d", rep.RiskScore)
+	}
+	if len(rep.Obfuscation.HighEntropySections) != 1 || rep.Obfuscation.HighEntropySections[0].Entropy != 8.0 {
+		t.Errorf("expected clamped HighEntropySections=[8.0], got %+v", rep.Obfuscation.HighEntropySections)
+	}
+	if len(rep.NetworkIoCs.IPv6) != 0 {
+		t.Errorf("expected 0 false-positive IPv6 IoCs from Rust namespaces, got %+v", rep.NetworkIoCs.IPv6)
+	}
+
+	// Verify CAP-EXEC-001 deduplicated KERNEL32.DLL / kernel32.dll and ignored httpopen (MatchCount == 1, SeverityMedium)
+	for _, f := range rep.Findings {
+		if f.ID == "CAP-EXEC-001" {
+			if f.MatchCount != 1 {
+				t.Errorf("expected CAP-EXEC-001 MatchCount=1 (deduped DLL case, excluded httpopen), got %d: %+v", f.MatchCount, f.Evidence)
+			}
+			for _, ev := range f.Evidence {
+				if strings.Contains(strings.ToLower(ev), "httpopen") {
+					t.Errorf("httpopen falsely matched execution finding: %+v", f.Evidence)
+				}
+			}
+		}
+		if f.ID == "CAP-SEC-001" && f.MatchCount != 1 {
+			t.Errorf("expected duplicate secrets deduplicated to MatchCount=1, got %d: %+v", f.MatchCount, f.Evidence)
+		}
 	}
 }

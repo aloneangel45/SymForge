@@ -300,3 +300,312 @@ func buildUniversalFatMachO(t *testing.T, slices []fatSlice) []byte {
 	}
 	return buf.Bytes()
 }
+
+// buildSyntheticPE constructs a minimal valid PE32 or PE32+ executable with a single .rdata
+// section at RVA 0x1000 (file offset 0x200) containing rdata and pointing IMAGE_DIRECTORY_ENTRY_IMPORT
+// at importRVA with importSize.
+func buildSyntheticPE(is64 bool, imageBase uint64, entryRVA, importRVA, importSize uint32, rdata []byte) []byte {
+	const (
+		peOff      = 0x80
+		secFileOff = 0x200
+		secRVA     = 0x1000
+	)
+	secSize := len(rdata)
+	if secSize < 0x200 {
+		secSize = 0x200
+	}
+	buf := make([]byte, secFileOff+secSize)
+	// DOS header
+	buf[0], buf[1] = 'M', 'Z'
+	binary.LittleEndian.PutUint32(buf[0x3c:0x40], peOff)
+	// PE signature
+	copy(buf[peOff:peOff+4], "PE\x00\x00")
+	// COFF FileHeader (20 bytes)
+	coffOff := peOff + 4
+	optSize := uint16(224)
+	machine := uint16(0x014c) // IMAGE_FILE_MACHINE_I386
+	if is64 {
+		optSize = 240
+		machine = 0x8664 // IMAGE_FILE_MACHINE_AMD64
+	}
+	binary.LittleEndian.PutUint16(buf[coffOff+0:coffOff+2], machine)
+	binary.LittleEndian.PutUint16(buf[coffOff+2:coffOff+4], 1) // NumberOfSections
+	binary.LittleEndian.PutUint16(buf[coffOff+16:coffOff+18], optSize)
+	binary.LittleEndian.PutUint16(buf[coffOff+18:coffOff+20], 0x0002) // IMAGE_FILE_EXECUTABLE_IMAGE
+
+	// OptionalHeader
+	optOff := coffOff + 20
+	if is64 {
+		binary.LittleEndian.PutUint16(buf[optOff+0:optOff+2], 0x20b) // PE32+
+		binary.LittleEndian.PutUint32(buf[optOff+16:optOff+20], entryRVA)
+		binary.LittleEndian.PutUint64(buf[optOff+24:optOff+32], imageBase)
+		binary.LittleEndian.PutUint32(buf[optOff+32:optOff+36], 0x1000) // SectionAlignment
+		binary.LittleEndian.PutUint32(buf[optOff+36:optOff+40], 0x200)  // FileAlignment
+		binary.LittleEndian.PutUint32(buf[optOff+56:optOff+60], 0x4000) // SizeOfImage
+		binary.LittleEndian.PutUint32(buf[optOff+60:optOff+64], 0x200)  // SizeOfHeaders
+		binary.LittleEndian.PutUint32(buf[optOff+108:optOff+112], 16)   // NumberOfRvaAndSizes
+		ddOff := optOff + 112 + 8                                       // DataDirectory[1] = IMPORT
+		binary.LittleEndian.PutUint32(buf[ddOff:ddOff+4], importRVA)
+		binary.LittleEndian.PutUint32(buf[ddOff+4:ddOff+8], importSize)
+	} else {
+		binary.LittleEndian.PutUint16(buf[optOff+0:optOff+2], 0x10b) // PE32
+		binary.LittleEndian.PutUint32(buf[optOff+16:optOff+20], entryRVA)
+		binary.LittleEndian.PutUint32(buf[optOff+28:optOff+32], uint32(imageBase))
+		binary.LittleEndian.PutUint32(buf[optOff+32:optOff+36], 0x1000)
+		binary.LittleEndian.PutUint32(buf[optOff+36:optOff+40], 0x200)
+		binary.LittleEndian.PutUint32(buf[optOff+56:optOff+60], 0x4000)
+		binary.LittleEndian.PutUint32(buf[optOff+60:optOff+64], 0x200)
+		binary.LittleEndian.PutUint32(buf[optOff+92:optOff+96], 16)
+		ddOff := optOff + 96 + 8 // DataDirectory[1] = IMPORT
+		binary.LittleEndian.PutUint32(buf[ddOff:ddOff+4], importRVA)
+		binary.LittleEndian.PutUint32(buf[ddOff+4:ddOff+8], importSize)
+	}
+
+	// Section header (.rdata)
+	secHdrOff := optOff + int(optSize)
+	copy(buf[secHdrOff:secHdrOff+8], ".rdata\x00\x00")
+	binary.LittleEndian.PutUint32(buf[secHdrOff+8:secHdrOff+12], uint32(secSize))
+	binary.LittleEndian.PutUint32(buf[secHdrOff+12:secHdrOff+16], secRVA)
+	binary.LittleEndian.PutUint32(buf[secHdrOff+16:secHdrOff+20], uint32(secSize))
+	binary.LittleEndian.PutUint32(buf[secHdrOff+20:secHdrOff+24], secFileOff)
+	binary.LittleEndian.PutUint32(buf[secHdrOff+36:secHdrOff+40], peScnMemRead)
+
+	copy(buf[secFileOff:], rdata)
+	return buf
+}
+
+func TestCraftedPEImportTableHardening(t *testing.T) {
+	// 1. Valid PE32 (4-byte thunks): named import + ordinal import + zero entryRVA (DLL)
+	rdata32 := make([]byte, 0x200)
+	// Descriptor at RVA 0x1000 (off 0): INT=0x1040, Name=0x1080, IAT=0x1060
+	binary.LittleEndian.PutUint32(rdata32[0:4], 0x1040)
+	binary.LittleEndian.PutUint32(rdata32[12:16], 0x1080)
+	binary.LittleEndian.PutUint32(rdata32[16:20], 0x1060)
+	// Thunks at off 0x40: named @ 0x10a0, ordinal #42 (0x8000002a), terminator 0
+	binary.LittleEndian.PutUint32(rdata32[0x40:0x44], 0x10a0)
+	binary.LittleEndian.PutUint32(rdata32[0x44:0x48], 0x8000002a)
+	copy(rdata32[0x80:], "WS2_32.dll\x00")
+	copy(rdata32[0xa2:], "WSAStartup\x00")
+
+	pe32 := buildSyntheticPE(false, 0x400000, 0, 0x1000, 40, rdata32)
+	lb32, err := LoadBytes("crafted32.dll", pe32)
+	if err != nil {
+		t.Fatalf("LoadBytes PE32 failed: %v", err)
+	}
+	if lb32.Info.EntryPoint != 0 {
+		t.Errorf("expected EntryPoint=0 when entryRVA=0, got 0x%x", lb32.Info.EntryPoint)
+	}
+	if len(lb32.Imports) != 2 {
+		t.Fatalf("expected 2 PE32 imports, got %+v", lb32.Imports)
+	}
+	if lb32.Imports[0].Name != "Ordinal#42" || lb32.Imports[1].Name != "WSAStartup" || lb32.Imports[1].Address != 0x401060 {
+		t.Fatalf("unexpected PE32 imports: %+v", lb32.Imports)
+	}
+
+	// 2. PE32+ (8-byte thunks): valid named, valid ordinal, bound/corrupted upper-bits thunk (must skip),
+	//    stripped INT falling back to IAT, and truncated non-null-terminated string at EOF.
+	rdata64 := make([]byte, 0x200)
+	// Descriptor 0: INT=0x999900 (unmapped -> must fall back to IAT=0x1060), Name=0x10c0, IAT=0x1060
+	binary.LittleEndian.PutUint32(rdata64[0:4], 0x999900)
+	binary.LittleEndian.PutUint32(rdata64[12:16], 0x10c0)
+	binary.LittleEndian.PutUint32(rdata64[16:20], 0x1060)
+	// Thunks at 0x60:
+	//   [0] valid Hint/Name RVA 0x10e0 ("VirtualAlloc")
+	//   [1] bound/corrupted 64-bit pointer 0x00007ff8_000010e0 (bits 31..62 non-zero -> MUST be ignored)
+	//   [2] valid 64-bit ordinal (1<<63)|7 -> "Ordinal#7"
+	//   [3] truncated string RVA pointing near EOF (0x11fa, no null byte) -> MUST be skipped cleanly
+	//   [4] terminator 0
+	binary.LittleEndian.PutUint64(rdata64[0x60:0x68], 0x10e0)
+	binary.LittleEndian.PutUint64(rdata64[0x68:0x70], 0x00007ff8000010e0)
+	binary.LittleEndian.PutUint64(rdata64[0x70:0x78], (uint64(1)<<63)|7)
+	binary.LittleEndian.PutUint64(rdata64[0x78:0x80], 0x11fa)
+	copy(rdata64[0xc0:], "KERNEL32.dll\x00")
+	copy(rdata64[0xe2:], "VirtualAlloc\x00")
+	copy(rdata64[0x1fc:], "NOZ!") // 4 bytes at very end of section without NUL
+
+	pe64 := buildSyntheticPE(true, 0x140000000, 0x1000, 0x1000, 40, rdata64)
+	lb64, err := LoadBytes("crafted64.exe", pe64)
+	if err != nil {
+		t.Fatalf("LoadBytes PE32+ failed: %v", err)
+	}
+	if len(lb64.Imports) != 2 {
+		t.Fatalf("expected exactly 2 valid PE32+ imports (skipping bound/truncated thunks), got %+v", lb64.Imports)
+	}
+	if lb64.Imports[0].Name != "Ordinal#7" || lb64.Imports[1].Name != "VirtualAlloc" {
+		t.Fatalf("unexpected PE32+ imports: %+v", lb64.Imports)
+	}
+
+	// 3. Circular / repeated descriptor DoS: 500 identical descriptors pointing to same thunk table
+	rdataDoS := make([]byte, 512*20+0x200)
+	thunkOff := 512 * 20
+	nameOff := thunkOff + 0x40
+	hintOff := thunkOff + 0x80
+	for i := 0; i < 500; i++ {
+		off := i * 20
+		binary.LittleEndian.PutUint32(rdataDoS[off+0:off+4], uint32(0x1000+thunkOff))
+		binary.LittleEndian.PutUint32(rdataDoS[off+12:off+16], uint32(0x1000+nameOff))
+		binary.LittleEndian.PutUint32(rdataDoS[off+16:off+20], uint32(0x1000+thunkOff))
+	}
+	binary.LittleEndian.PutUint64(rdataDoS[thunkOff:thunkOff+8], uint64(0x1000+hintOff))
+	copy(rdataDoS[nameOff:], "NTDLL.dll\x00")
+	copy(rdataDoS[hintOff+2:], "NtClose\x00")
+
+	peDoS := buildSyntheticPE(true, 0x140000000, 0x1000, 0x1000, uint32(500*20), rdataDoS)
+	lbDoS, err := LoadBytes("crafted_dos.exe", peDoS)
+	if err != nil {
+		t.Fatalf("LoadBytes PE DoS failed: %v", err)
+	}
+	if len(lbDoS.Imports) > 2 {
+		t.Fatalf("expected deduplicated/guarded imports from circular descriptors, got %d entries", len(lbDoS.Imports))
+	}
+
+	// 4. Huge ImageBase uint64 wraparound safety (must not panic)
+	peWrap := buildSyntheticPE(true, ^uint64(0)-0x100, 0x1000, 0x1000, 40, rdata64)
+	if _, err := LoadBytes("crafted_wrap.exe", peWrap); err != nil {
+		t.Fatalf("LoadBytes PE wraparound failed unexpectedly: %v", err)
+	}
+}
+
+func TestCraftedELFOverflowAndMissingDynsym(t *testing.T) {
+	// 1. Minimal 64-bit ELF with 0 sections (sstrip) and PT_LOAD Filesz that overflows uint64(Off + Filesz)
+	elfBuf := make([]byte, 0x200)
+	copy(elfBuf[0:4], []byte{0x7f, 'E', 'L', 'F'})
+	elfBuf[4] = 2 // ELFCLASS64
+	elfBuf[5] = 1 // ELFDATA2LSB
+	elfBuf[6] = 1 // EV_CURRENT
+	binary.LittleEndian.PutUint16(elfBuf[16:18], 2)    // ET_EXEC
+	binary.LittleEndian.PutUint16(elfBuf[18:20], 62)   // EM_X86_64
+	binary.LittleEndian.PutUint32(elfBuf[20:24], 1)    // EV_CURRENT
+	binary.LittleEndian.PutUint64(elfBuf[24:32], 0x400100)
+	binary.LittleEndian.PutUint64(elfBuf[32:40], 64)   // e_phoff
+	binary.LittleEndian.PutUint16(elfBuf[52:54], 64)   // e_ehsize
+	binary.LittleEndian.PutUint16(elfBuf[54:56], 56)   // e_phentsize
+	binary.LittleEndian.PutUint16(elfBuf[56:58], 1)    // e_phnum
+
+	// PT_LOAD at offset 64 with p_offset=0x100 and p_filesz=0x7fffffffffffffff (exceeds file size & tests overflow-safe clamping)
+	ph := elfBuf[64 : 64+56]
+	binary.LittleEndian.PutUint32(ph[0:4], 1) // PT_LOAD
+	binary.LittleEndian.PutUint32(ph[4:8], 5) // PF_R | PF_X
+	binary.LittleEndian.PutUint64(ph[8:16], 0x100)
+	binary.LittleEndian.PutUint64(ph[16:24], 0x400100)
+	binary.LittleEndian.PutUint64(ph[24:32], 0x400100)
+	binary.LittleEndian.PutUint64(ph[32:40], 0x7fffffffffffffff)
+	binary.LittleEndian.PutUint64(ph[40:48], 0x7fffffffffffffff)
+	binary.LittleEndian.PutUint64(ph[48:56], 0x1000)
+
+	lb, err := LoadBytes("crafted_overflow.elf", elfBuf)
+	if err != nil {
+		t.Fatalf("LoadBytes stripped large-Filesz ELF failed: %v", err)
+	}
+	if len(lb.Sections) != 1 || lb.Sections[0].FileSize != 0x100 {
+		t.Fatalf("expected clamped PT_LOAD section size 0x100, got %+v", lb.Sections)
+	}
+	if !lb.Info.Stripped {
+		t.Errorf("expected Stripped=true on 0-section ELF")
+	}
+
+	// Also ensure extreme ^uint64(0)-0x50 Filesz fails cleanly without panicking
+	binary.LittleEndian.PutUint64(ph[32:40], ^uint64(0)-0x50)
+	if _, err := LoadBytes("crafted_wrap_elf.elf", elfBuf); err == nil {
+		t.Fatalf("expected error for extreme >MaxInt64 ELF PT_LOAD Filesz")
+	}
+
+	// 2. ELF with truncated/out-of-bounds .dynsym section header (must load gracefully without failing)
+	elfTrunc := make([]byte, 0x300)
+	copy(elfTrunc[0:4], []byte{0x7f, 'E', 'L', 'F'})
+	elfTrunc[4] = 2 // ELFCLASS64
+	elfTrunc[5] = 1 // ELFDATA2LSB
+	elfTrunc[6] = 1
+	binary.LittleEndian.PutUint16(elfTrunc[16:18], 2)
+	binary.LittleEndian.PutUint16(elfTrunc[18:20], 62)
+	binary.LittleEndian.PutUint32(elfTrunc[20:24], 1)
+	binary.LittleEndian.PutUint64(elfTrunc[40:48], 0x80) // e_shoff
+	binary.LittleEndian.PutUint16(elfTrunc[52:54], 64)
+	binary.LittleEndian.PutUint16(elfTrunc[58:60], 64) // e_shentsize
+	binary.LittleEndian.PutUint16(elfTrunc[60:62], 3)  // e_shnum: NULL, .shstrtab, .dynsym
+	binary.LittleEndian.PutUint16(elfTrunc[62:64], 1)  // e_shstrndx = 1
+
+	shstr := []byte("\x00.shstrtab\x00.dynsym\x00")
+	copy(elfTrunc[0x200:], shstr)
+	// Section 1: .shstrtab
+	sh1 := elfTrunc[0x80+64 : 0x80+128]
+	binary.LittleEndian.PutUint32(sh1[0:4], 1)
+	binary.LittleEndian.PutUint32(sh1[4:8], 3) // SHT_STRTAB
+	binary.LittleEndian.PutUint64(sh1[24:32], 0x200)
+	binary.LittleEndian.PutUint64(sh1[32:40], uint64(len(shstr)))
+	// Section 2: .dynsym pointing past EOF (truncated binary)
+	sh2 := elfTrunc[0x80+128 : 0x80+192]
+	binary.LittleEndian.PutUint32(sh2[0:4], 11)
+	binary.LittleEndian.PutUint32(sh2[4:8], 11) // SHT_DYNSYM
+	binary.LittleEndian.PutUint64(sh2[24:32], 0x9000)
+	binary.LittleEndian.PutUint64(sh2[32:40], 0x200)
+	binary.LittleEndian.PutUint32(sh2[40:44], 1)  // sh_link
+	binary.LittleEndian.PutUint64(sh2[56:64], 24) // sh_entsize
+
+	lbTrunc, err := LoadBytes("truncated_dynsym.elf", elfTrunc)
+	if err != nil {
+		t.Fatalf("LoadBytes ELF with truncated .dynsym should succeed gracefully, got: %v", err)
+	}
+	if lbTrunc.Info.Format != model.FormatELF || !lbTrunc.Info.Stripped {
+		t.Fatalf("unexpected truncated ELF info: %+v", lbTrunc.Info)
+	}
+}
+
+func TestUniversalFatMachOAliasesAndAvailableArchesErrors(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "sample.go")
+	if err := os.WriteFile(src, []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	build := func(goarch string) []byte {
+		outBin := filepath.Join(tmp, "darwin_"+goarch)
+		cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outBin, src)
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=darwin", "GOARCH="+goarch)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go build darwin/%s failed: %v\n%s", goarch, err, string(out))
+		}
+		b, err := os.ReadFile(outBin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+
+	armBytes := build("arm64")
+	amdBytes := build("amd64")
+	fatBytes := buildUniversalFatMachO(t, []fatSlice{
+		{cpu: macho.CpuArm64, subCPU: 0, align: 14, data: armBytes},
+		{cpu: macho.CpuAmd64, subCPU: 3, align: 12, data: amdBytes},
+	})
+
+	for _, tc := range []struct {
+		alias string
+		want  model.Architecture
+	}{
+		{"x86_64", model.ArchX86_64},
+		{"amd64", model.ArchX86_64},
+		{"x64", model.ArchX86_64},
+		{"aarch64", model.ArchARM64},
+		{"arm64", model.ArchARM64},
+		{"arm64e", model.ArchARM64},
+	} {
+		lb, err := LoadBytesWithOptions("fat_alias", fatBytes, LoadOptions{Arch: tc.alias})
+		if err != nil {
+			t.Fatalf("alias %q failed: %v", tc.alias, err)
+		}
+		if lb.Info.Arch != tc.want {
+			t.Errorf("alias %q -> arch %q, want %q", tc.alias, lb.Info.Arch, tc.want)
+		}
+	}
+
+	// Both valid-but-missing arch AND unrecognized arch must list AvailableArches in error message
+	for _, badArch := range []string{"x86", "mips64"} {
+		_, err := LoadBytesWithOptions("fat_missing", fatBytes, LoadOptions{Arch: badArch})
+		if err == nil {
+			t.Fatalf("expected error for %q on arm64+x86_64 Fat Mach-O", badArch)
+		}
+		if !strings.Contains(err.Error(), "arm64") || !strings.Contains(err.Error(), "x86_64") {
+			t.Errorf("error for %q did not list AvailableArches: %v", badArch, err)
+		}
+	}
+}

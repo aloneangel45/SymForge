@@ -175,7 +175,7 @@ func newFunctionsCmd() *cobra.Command {
 			pkgFilter := strings.ToLower(strings.TrimSpace(pkgSub))
 			q := strings.ToLower(strings.TrimSpace(query))
 
-			var filtered []model.Function
+			filtered := make([]model.Function, 0)
 			for _, fn := range res.Functions {
 				if userOnly && fn.Category != model.CategoryUser && fn.Category != model.CategoryDependency {
 					continue
@@ -333,7 +333,7 @@ func newStringsCmd() *cobra.Command {
 			k := strings.ToLower(strings.TrimSpace(kind))
 			q := strings.ToLower(strings.TrimSpace(query))
 
-			var outList []model.ExtractedString
+			outList := make([]model.ExtractedString, 0)
 			for _, st := range res.Strings {
 				if k != "" && k != "all" {
 					if k == "high_signal" {
@@ -400,7 +400,7 @@ func newTypesCmd() *cobra.Command {
 			k := strings.ToLower(strings.TrimSpace(kind))
 			q := strings.ToLower(strings.TrimSpace(query))
 
-			var matched []model.RecoveredType
+			matched := make([]model.RecoveredType, 0)
 			for _, t := range res.Types {
 				if k != "" && k != "all" && strings.ToLower(t.Kind) != k {
 					continue
@@ -469,7 +469,11 @@ func newDepsCmd() *cobra.Command {
 				return err
 			}
 			if asJSON {
-				return printJSON(out, res.Dependencies)
+				deps := res.Dependencies
+				if deps == nil {
+					deps = make([]model.Dependency, 0)
+				}
+				return printJSON(out, deps)
 			}
 
 			tw := tabwriter.NewWriter(out, 2, 4, 2, ' ', 0)
@@ -508,7 +512,7 @@ func newDemangleCmd() *cobra.Command {
 
 			out := cmd.OutOrStdout()
 			if asJSON {
-				var rows []map[string]any
+				rows := make([]map[string]any, 0, len(inputs))
 				for _, sym := range inputs {
 					dem, scheme, ok := rustrecover.Demangle(sym)
 					rows = append(rows, map[string]any{
@@ -785,6 +789,9 @@ func newPathCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(fromFn) == "" || strings.TrimSpace(toFn) == "" {
 				return fmt.Errorf("both --from and --to are required")
+			}
+			if maxDepth <= 0 {
+				return fmt.Errorf("--max-depth must be > 0 (got %d)", maxDepth)
 			}
 			res, err := analyzer.DefaultEngine.AnalyzeFile(args[0], analyzer.Options{Arch: arch})
 			if err != nil {

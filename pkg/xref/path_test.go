@@ -63,4 +63,43 @@ func TestFindCallPathBFS(t *testing.T) {
 	if _, err := xref.FindCallPath(funcs, "nonexistent", "main.main", 12); err == nil {
 		t.Fatalf("expected error for missing source function")
 	}
+
+	// 6. maxDepth <= 0 falls back cleanly to DefaultMaxPathDepth; huge maxDepth clamped to MaxPathDepth
+	defZero, err := xref.FindCallPath(funcs, "main.main", "0x5000", 0)
+	if err != nil || !defZero.Found || defZero.MaxDepth != xref.DefaultMaxPathDepth {
+		t.Fatalf("expected maxDepth=0 fallback to %d, got err=%v res=%+v", xref.DefaultMaxPathDepth, err, defZero)
+	}
+	defNeg, err := xref.FindCallPath(funcs, "main.main", "0x5000", -5)
+	if err != nil || !defNeg.Found || defNeg.MaxDepth != xref.DefaultMaxPathDepth {
+		t.Fatalf("expected maxDepth=-5 fallback to %d, got err=%v res=%+v", xref.DefaultMaxPathDepth, err, defNeg)
+	}
+	clampedHuge, err := xref.FindCallPath(funcs, "main.main", "0x5000", 99999)
+	if err != nil || !clampedHuge.Found || clampedHuge.MaxDepth != xref.MaxPathDepth {
+		t.Fatalf("expected huge maxDepth clamped to %d, got err=%v res=%+v", xref.MaxPathDepth, err, clampedHuge)
+	}
+
+	// 7. Distinct functions with zero Entry must NOT falsely match as 0-hop self-path
+	zeroFuncs := []model.Function{
+		{Name: "alpha", Entry: 0},
+		{Name: "beta", Entry: 0},
+	}
+	zRes, err := xref.FindCallPath(zeroFuncs, "alpha", "beta", 6)
+	if err != nil {
+		t.Fatalf("FindCallPath zero-entry failed: %v", err)
+	}
+	if zRes.Found {
+		t.Fatalf("expected Found=false for distinct zero-entry functions, got %+v", zRes)
+	}
+
+	// 8. Pure mutual cycles + self-loops with unreachable target must terminate safely
+	cyclic := []model.Function{
+		{Name: "n1", Entry: 0x100, Calls: []uint64{0x100, 0x200}},
+		{Name: "n2", Entry: 0x200, Calls: []uint64{0x300, 0x100}},
+		{Name: "n3", Entry: 0x300, Calls: []uint64{0x100, 0x200, 0x300}},
+		{Name: "n4", Entry: 0x400},
+	}
+	cRes, err := xref.FindCallPath(cyclic, "n1", "n4", 64)
+	if err != nil || cRes.Found || cRes.NodesVisited != 3 {
+		t.Fatalf("unexpected cyclic unreachable result: err=%v res=%+v", err, cRes)
+	}
 }

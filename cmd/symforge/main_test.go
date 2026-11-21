@@ -41,7 +41,7 @@ func main() { fmt.Println(RunCheck(AuthHeader{Token: "ok"})) }
 		return buf.String()
 	}
 
-	if out := runCLI("version"); !strings.Contains(out, "symforge v") {
+	if out := runCLI("version"); !strings.Contains(out, "symforge v1.1.1") {
 		t.Fatalf("unexpected version output: %s", out)
 	}
 	if out := runCLI("inspect", sampleBin); !strings.Contains(out, "arm64") || !strings.Contains(out, "Stripped=true") {
@@ -80,5 +80,22 @@ func main() { fmt.Println(RunCheck(AuthHeader{Token: "ok"})) }
 	}
 	if out := runCLI("path", sampleBin, "--from", "main.main", "--to", "RunCheck", "--max-depth", "8"); !strings.Contains(out, "found=true") || !strings.Contains(out, "RunCheck") {
 		t.Fatalf("unexpected path output:\n%s", out)
+	}
+
+	// Verify empty JSON output marshals as [] instead of null
+	if out := strings.TrimSpace(runCLI("functions", sampleBin, "--query", "__no_such_sym__", "--json")); out != "[]" {
+		t.Fatalf("expected [] for empty functions --json, got %q", out)
+	}
+
+	// Verify --max-depth <= 0 is rejected cleanly by CLI path command
+	for _, badDepth := range []string{"0", "-3"} {
+		var errBuf bytes.Buffer
+		cmd := newRootCommand()
+		cmd.SetOut(&errBuf)
+		cmd.SetErr(&errBuf)
+		cmd.SetArgs([]string{"path", sampleBin, "--from", "main.main", "--to", "RunCheck", "--max-depth", badDepth})
+		if err := cmd.Execute(); err == nil {
+			t.Fatalf("expected error for symforge path --max-depth %s", badDepth)
+		}
 	}
 }

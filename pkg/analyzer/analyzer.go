@@ -4,7 +4,10 @@
 package analyzer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -43,10 +46,12 @@ type FunctionInspection struct {
 }
 
 type cacheKey struct {
-	absPath   string
-	size      int64
-	mtimeNano int64
-	arch      string
+	absPath      string
+	size         int64
+	mtimeNano    int64
+	arch         string
+	minStringLen int
+	maxStrings   int
 }
 
 type cacheEntry struct {
@@ -109,19 +114,33 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 	}
 
 	normArch := ""
-	if strings.TrimSpace(opts.Arch) != "" {
-		a, ok := loader.NormalizeArch(opts.Arch)
-		if !ok {
-			return nil, fmt.Errorf("unsupported architecture %q (expected x86_64/amd64, arm64, x86, or arm)", opts.Arch)
+	rawArch := strings.ToLower(strings.TrimSpace(opts.Arch))
+	if rawArch != "" {
+		if rawArch == "arm64e" {
+			normArch = "arm64e"
+		} else if a, ok := loader.NormalizeArch(rawArch); ok {
+			normArch = string(a)
+		} else {
+			// Delegate unknown arch validation to LoadFileWithOptions so universal Fat Mach-O
+			// binaries report their available architecture slices in the error message.
+			normArch = rawArch
 		}
-		normArch = string(a)
 	}
 
 	ck := cacheKey{
-		absPath:   absPath,
-		size:      st.Size(),
-		mtimeNano: st.ModTime().UnixNano(),
-		arch:      normArch,
+		absPath:      absPath,
+		size:         st.Size(),
+		mtimeNano:    st.ModTime().UnixNano(),
+		arch:         normArch,
+		minStringLen: opts.MinStringLen,
+		maxStrings:   opts.MaxStrings,
+	}
+
+	// On filesystems with coarse mtime ticks (1-15ms), rapid in-place overwrites of the same
+	// byte length can share identical (size, mtimeNano). Verify SHA-256 for recently modified files.
+	recentlyModified := false
+	if age := time.Since(st.ModTime()); age < 2*time.Second {
+		recentlyModified = true
 	}
 
 	var flight *inflightAnalysis
@@ -129,6 +148,30 @@ func (e *Engine) analyzeCached(path string, opts Options) (*cacheEntry, error) {
 		e.mu.Lock()
 		for i, item := range e.entries {
 			if item.key == ck {
+				stale := false
+				if recentlyModified && item.result != nil && item.result.Binary.SHA256 != "" {
+					e.mu.Unlock()
+					if curHash, hErr := fileSHA256(absPath); hErr == nil && curHash != item.result.Binary.SHA256 {
+						stale = true
+					}
+					if !stale {
+						e.mu.Lock()
+						for j, cur := range e.entries {
+							if cur.key == ck {
+								if j > 0 {
+									copy(e.entries[1:j+1], e.entries[0:j])
+									e.entries[0] = cur
+								}
+								e.mu.Unlock()
+								return &cur, nil
+							}
+						}
+						e.mu.Unlock()
+						return &item, nil
+					}
+					e.mu.Lock()
+					break
+				}
 				if i > 0 {
 					copy(e.entries[1:i+1], e.entries[0:i])
 					e.entries[0] = item
@@ -637,4 +680,17 @@ func mergeDependencies(goRes *gorecover.Result, rustRes *rustrecover.Result, goD
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

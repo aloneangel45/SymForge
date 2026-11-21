@@ -61,14 +61,12 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 		var secBytes []byte
 		var fileSize uint64
 		if s.Type != elf.SHT_NOBITS && s.Size > 0 && s.Offset < uint64(len(data)) {
-			end := s.Offset + s.Size
-			if end > uint64(len(data)) {
-				end = uint64(len(data))
+			avail := uint64(len(data)) - s.Offset
+			fileSize = s.Size
+			if fileSize > avail {
+				fileSize = avail
 			}
-			if end > s.Offset {
-				secBytes = data[s.Offset:end]
-				fileSize = end - s.Offset
-			}
+			secBytes = data[s.Offset : s.Offset+fileSize]
 		}
 		sections = append(sections, model.SectionInfo{
 			Name:        s.Name,
@@ -89,17 +87,18 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 			if p.Type != elf.PT_LOAD || p.Filesz == 0 || p.Off >= uint64(len(data)) {
 				continue
 			}
-			end := p.Off + p.Filesz
-			if end > uint64(len(data)) {
-				end = uint64(len(data))
+			avail := uint64(len(data)) - p.Off
+			fSize := p.Filesz
+			if fSize > avail {
+				fSize = avail
 			}
-			segBytes := data[p.Off:end]
+			segBytes := data[p.Off : p.Off+fSize]
 			sections = append(sections, model.SectionInfo{
 				Name:        fmt.Sprintf("PT_LOAD_%d", idx),
 				VirtualAddr: p.Vaddr,
 				VirtualSize: p.Memsz,
 				FileOffset:  p.Off,
-				FileSize:    end - p.Off,
+				FileSize:    fSize,
 				Entropy:     ShannonEntropy(segBytes),
 				Executable:  (p.Flags & elf.PF_X) != 0,
 				Readable:    (p.Flags & elf.PF_R) != 0,
@@ -110,15 +109,16 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 
 	var syms []model.SymbolEntry
 	staticSyms, symErr := ef.Symbols()
-	stripped := symErr != nil || len(staticSyms) == 0
+	staticResolved := 0
 	for _, sym := range staticSyms {
 		if sym.Name == "" || sym.Value == 0 {
 			continue
 		}
 		secName := ""
-		if int(sym.Section) >= 0 && int(sym.Section) < len(ef.Sections) {
+		if sym.Section > elf.SHN_UNDEF && sym.Section < elf.SHN_LORESERVE && int(sym.Section) < len(ef.Sections) {
 			secName = ef.Sections[sym.Section].Name
 		}
+		staticResolved++
 		syms = append(syms, model.SymbolEntry{
 			Name:    sym.Name,
 			Addr:    sym.Value,
@@ -127,8 +127,10 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 			Dynamic: false,
 		})
 	}
+	stripped := symErr != nil || staticResolved == 0
 
-	if dynSyms, dErr := ef.DynamicSymbols(); dErr == nil {
+	dynSyms, dErr := ef.DynamicSymbols()
+	if dErr == nil {
 		for _, sym := range dynSyms {
 			if sym.Name == "" || sym.Value == 0 {
 				continue
@@ -142,7 +144,7 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 		}
 	}
 
-	imports := extractELFImports(ef)
+	imports := extractELFImports(ef, dynSyms, dErr == nil)
 
 	return &LoadedBinary{
 		Info: model.BinaryInfo{
@@ -164,7 +166,7 @@ func loadELF(path string, data []byte) (*LoadedBinary, error) {
 	}, nil
 }
 
-func extractELFImports(ef *elf.File) []model.ImportSymbol {
+func extractELFImports(ef *elf.File, dynSyms []elf.Symbol, hasDynSyms bool) []model.ImportSymbol {
 	var imports []model.ImportSymbol
 	seenSym := make(map[string]struct{})
 	seenLibWithSym := make(map[string]struct{})
@@ -186,7 +188,7 @@ func extractELFImports(ef *elf.File) []model.ImportSymbol {
 	}
 
 	// Fallback for undefined dynamic symbols if ImportedSymbols returned partial or errored
-	if dynSyms, err := ef.DynamicSymbols(); err == nil {
+	if hasDynSyms {
 		for _, sym := range dynSyms {
 			if sym.Name == "" || sym.Section != elf.SHN_UNDEF {
 				continue

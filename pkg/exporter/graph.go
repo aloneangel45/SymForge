@@ -13,6 +13,9 @@ const defaultGraphLimit = 60
 
 // ExportDOT renders a Graphviz DOT directed call graph (digraph) suitable for dot/svg rendering.
 func ExportDOT(res *model.AnalysisResult, opts Options) []byte {
+	if res == nil {
+		return nil
+	}
 	nodes, edges := buildGraphSubset(res, opts)
 
 	var buf bytes.Buffer
@@ -26,7 +29,11 @@ func ExportDOT(res *model.AnalysisResult, opts Options) []byte {
 
 	for _, fn := range nodes {
 		fill, stroke := dotCategoryColors(fn.Category)
-		label := fmt.Sprintf("%s\\n0x%x", dotEscape(shortGraphLabel(preferredDisplayName(fn))), fn.Entry)
+		name := preferredDisplayName(fn)
+		if name == "" {
+			name = fmt.Sprintf("sub_%x", fn.Entry)
+		}
+		label := fmt.Sprintf("%s\\n0x%x", dotEscape(shortGraphLabel(name)), fn.Entry)
 		fmt.Fprintf(&buf, "  fn_%x [label=\"%s\", fillcolor=\"%s\", color=\"%s\"];\n",
 			fn.Entry, label, fill, stroke)
 	}
@@ -42,6 +49,9 @@ func ExportDOT(res *model.AnalysisResult, opts Options) []byte {
 
 // ExportMermaid renders a Mermaid flowchart LR call graph with category styling.
 func ExportMermaid(res *model.AnalysisResult, opts Options) []byte {
+	if res == nil {
+		return nil
+	}
 	nodes, edges := buildGraphSubset(res, opts)
 
 	var buf bytes.Buffer
@@ -56,7 +66,11 @@ func ExportMermaid(res *model.AnalysisResult, opts Options) []byte {
 
 	for _, fn := range nodes {
 		cls := mermaidCategoryClass(fn.Category)
-		label := fmt.Sprintf("%s (0x%x)", mermaidLabelEscape(shortGraphLabel(preferredDisplayName(fn))), fn.Entry)
+		name := preferredDisplayName(fn)
+		if name == "" {
+			name = fmt.Sprintf("sub_%x", fn.Entry)
+		}
+		label := fmt.Sprintf("%s (0x%x)", mermaidLabelEscape(shortGraphLabel(name)), fn.Entry)
 		fmt.Fprintf(&buf, "  fn_%x[\"%s\"]:::%s\n", fn.Entry, label, cls)
 	}
 	if len(edges) > 0 {
@@ -74,19 +88,25 @@ type graphEdge struct {
 }
 
 func buildGraphSubset(res *model.AnalysisResult, opts Options) ([]model.Function, []graphEdge) {
-	candidates := selectFunctions(res.Functions, opts.UserOnly)
-	if len(candidates) == 0 {
+	rawCandidates := selectFunctions(res.Functions, opts.UserOnly)
+	if len(rawCandidates) == 0 {
 		return nil, nil
+	}
+
+	// Deduplicate by Entry VA so duplicate entries never emit colliding DOT/Mermaid node declarations.
+	candidates := make([]model.Function, 0, len(rawCandidates))
+	inCand := make(map[uint64]bool, len(rawCandidates))
+	for _, fn := range rawCandidates {
+		if inCand[fn.Entry] {
+			continue
+		}
+		inCand[fn.Entry] = true
+		candidates = append(candidates, fn)
 	}
 
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = defaultGraphLimit
-	}
-
-	inCand := make(map[uint64]bool, len(candidates))
-	for _, fn := range candidates {
-		inCand[fn.Entry] = true
 	}
 
 	// Score candidates by internal graph connectivity and category priority so diagrams highlight meaningful call chains.
@@ -207,36 +227,58 @@ func shortGraphLabel(name string) string {
 			name = name[prev+1:]
 		}
 	}
-	if len(name) > 56 {
-		return name[:53] + "..."
+	runes := []rune(name)
+	if len(runes) > 56 {
+		return string(runes[:53]) + "..."
 	}
 	return name
 }
 
+func stripControlChars(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\r':
+			continue
+		case r == '\n' || r == '\t':
+			b.WriteByte(' ')
+		case r < 0x20 || r == 0x7f:
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func dotEscape(s string) string {
+	s = stripControlChars(s)
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\r", "")
 	return s
 }
 
+var mermaidLabelReplacer = strings.NewReplacer(
+	"&", "&amp;",
+	"#", "&#35;",
+	`"`, "&quot;",
+	"`", "&#96;",
+	`\`, "&#92;",
+	"[", "&#91;",
+	"]", "&#93;",
+	"{", "&#123;",
+	"}", "&#125;",
+	"<", "&lt;",
+	">", "&gt;",
+	"|", "&#124;",
+	";", "&#59;",
+)
+
 func mermaidLabelEscape(s string) string {
-	repl := strings.NewReplacer(
-		`"`, `'`,
-		`\`, `/`,
-		"\n", " ",
-		"\r", "",
-		"[", "(",
-		"]", ")",
-		"<", "&lt;",
-		">", "&gt;",
-	)
-	return repl.Replace(s)
+	return mermaidLabelReplacer.Replace(stripControlChars(s))
 }
 
 func mermaidCommentSafe(s string) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\r", "")
-	return s
+	return stripControlChars(s)
 }

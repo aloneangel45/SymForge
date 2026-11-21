@@ -202,9 +202,58 @@ func TestHTTPStreamableAndAllTools(t *testing.T) {
 		"from":      "main.main",
 		"to":        "DispatchBeacon",
 		"max_depth": 6,
+		"arch":      "amd64",
 	})
 	if !strings.Contains(outPath, `"found": true`) || !strings.Contains(outPath, "DispatchBeacon") {
 		t.Fatalf("unexpected trace_call_path output:\n%s", outPath)
+	}
+
+	// Verify empty search returns JSON [] instead of null, and huge graph limit is clamped safely
+	outEmptySearch := callTool("search_functions", map[string]any{"path": binPath, "query": "__symforge_no_such_func__", "arch": "x86_64"})
+	if !strings.Contains(outEmptySearch, `"functions": []`) {
+		t.Fatalf("expected empty JSON array [] for unmatched search_functions, got:\n%s", outEmptySearch)
+	}
+	outClampedDOT := callTool("export_re_script", map[string]any{
+		"path":   binPath,
+		"format": "dot",
+		"limit":  999999,
+		"arch":   "x86_64",
+	})
+	nodeLines := 0
+	for _, ln := range strings.Split(outClampedDOT, "\n") {
+		if strings.Contains(ln, "[label=") {
+			nodeLines++
+		}
+	}
+	if nodeLines > 500 {
+		t.Fatalf("export_re_script failed to clamp huge limit (emitted %d > 500 nodes)", nodeLines)
+	}
+
+	// Verify arch mismatch propagates cleanly as MCP tool error
+	badArchPayload, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      88,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "scan_capabilities",
+			"arguments": map[string]any{"path": binPath, "arch": "arm64"},
+		},
+	})
+	badArchResp, err := http.Post(ts.URL+"/mcp", "application/json", bytes.NewReader(badArchPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badArchResp.Body.Close()
+	var badArchParsed struct {
+		Result struct {
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(badArchResp.Body).Decode(&badArchParsed); err != nil {
+		t.Fatal(err)
+	}
+	if !badArchParsed.Result.IsError {
+		t.Fatalf("expected scan_capabilities with mismatched arch=arm64 on amd64 binary to return isError=true")
 	}
 
 	// Verify tools/list exposes all 11 MCP tools

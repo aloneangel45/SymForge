@@ -220,6 +220,9 @@ func Scan(res *model.AnalysisResult) (*ScanReport, error) {
 			score += 2
 		}
 	}
+	if score < 0 {
+		score = 0
+	}
 	if score > 100 {
 		score = 100
 	}
@@ -245,22 +248,26 @@ func detectExecution(fnNames []string, imports []model.ImportSymbol, strs []mode
 	}
 
 	execAPIs := []string{
-		"createprocess", "winexec", "shellexecute", "popen", "execve", "posix_spawn",
+		"createprocess", "winexec", "shellexecute", "posix_spawn",
+	}
+	exactExecAPIs := map[string]bool{
+		"system": true, "popen": true, "wpopen": true,
+		"execve": true, "fexecve": true, "execveat": true,
 	}
 	for _, imp := range imports {
 		if imp.Name == "" {
 			continue
 		}
 		clean := strings.TrimLeft(strings.ToLower(imp.Name), "_")
-		if clean == "system" || clean == "popen" {
-			ev.add("import:" + formatImport(imp))
+		if exactExecAPIs[clean] {
+			ev.addImport(imp)
 			highRisk = true
 			continue
 		}
 		for _, api := range execAPIs {
 			if strings.Contains(clean, api) {
-				ev.add("import:" + formatImport(imp))
-				if api == "winexec" || api == "createprocess" || api == "execve" {
+				ev.addImport(imp)
+				if api == "winexec" || api == "createprocess" {
 					highRisk = true
 				}
 				break
@@ -393,13 +400,30 @@ func isPlausibleIPv6(cand string) bool {
 	if cand == "::1" {
 		return true
 	}
+	parts := strings.Split(cand, ":")
 	nonEmpty := 0
-	for _, part := range strings.Split(cand, ":") {
+	hasDigit := false
+	for _, part := range parts {
 		if part != "" {
 			nonEmpty++
+			for i := 0; i < len(part); i++ {
+				if part[i] >= '0' && part[i] <= '9' {
+					hasDigit = true
+					break
+				}
+			}
 		}
 	}
-	return nonEmpty >= 2 && strings.Count(cand, ":") >= 2
+	colons := strings.Count(cand, ":")
+	if nonEmpty < 2 || colons < 2 {
+		return false
+	}
+	// Reject 2-colon pure-letter pairs (e.g. Rust/C++ "aead::aead", "de::de", "bad::cab")
+	// which parse as compressed IPv6 despite having no digits or additional hextets.
+	if colons == 2 && !hasDigit {
+		return false
+	}
+	return true
 }
 
 func detectNetwork(fnNames []string, imports []model.ImportSymbol, iocs NetworkIoCs) *Finding {
@@ -432,12 +456,12 @@ func detectNetwork(fnNames []string, imports []model.ImportSymbol, iocs NetworkI
 		}
 		clean := strings.TrimLeft(strings.ToLower(imp.Name), "_")
 		if exactNetAPIs[clean] {
-			ev.add("import:" + formatImport(imp))
+			ev.addImport(imp)
 			continue
 		}
 		for _, api := range netAPIs {
 			if strings.Contains(clean, api) {
-				ev.add("import:" + formatImport(imp))
+				ev.addImport(imp)
 				break
 			}
 		}
@@ -476,37 +500,39 @@ func detectMemoryInjection(fnNames []string, imports []model.ImportSymbol) *Find
 	hasRemoteThread := false
 	hasThreadCtx := false
 
-	checkName := func(prefix, raw string) {
+	checkName := func(raw string, addFn func()) {
 		clean := strings.TrimLeft(strings.ToLower(raw), "_")
 		switch {
 		case strings.Contains(clean, "writeprocessmemory") || strings.Contains(clean, "ntwritevirtualmemory"):
 			hasWrite = true
-			ev.add(prefix + raw)
+			addFn()
 		case strings.Contains(clean, "createremotethread") || strings.Contains(clean, "ntcreatethreadex") || strings.Contains(clean, "queueuserapc"):
 			hasRemoteThread = true
-			ev.add(prefix + raw)
+			addFn()
 		case strings.Contains(clean, "setthreadcontext"):
 			hasThreadCtx = true
-			ev.add(prefix + raw)
+			addFn()
 		case strings.Contains(clean, "virtualallocex") || strings.Contains(clean, "ntallocatevirtualmemory") || strings.Contains(clean, "ntunmapviewofsection"):
 			hasRemoteAlloc = true
 			hasAlloc = true
-			ev.add(prefix + raw)
+			addFn()
 		case clean == "virtualalloc" || clean == "virtualprotect" || clean == "virtualprotectex" || clean == "mprotect":
 			hasAlloc = true
-			ev.add(prefix + raw)
+			addFn()
 		}
 	}
 
 	for _, imp := range imports {
 		if imp.Name != "" {
-			checkName("import:", imp.Name)
+			impCopy := imp
+			checkName(imp.Name, func() { ev.addImport(impCopy) })
 		}
 	}
 	for _, fn := range fnNames {
 		low := strings.ToLower(fn)
 		if strings.Contains(low, "writeprocessmemory") || strings.Contains(low, "createremotethread") || strings.Contains(low, "virtualallocex") || strings.Contains(low, "ntcreatethreadex") {
-			checkName("fn:", fn)
+			fnCopy := fn
+			checkName(fn, func() { ev.add("fn:" + fnCopy) })
 		}
 	}
 
@@ -552,13 +578,13 @@ func detectAntiDebug(fnNames []string, imports []model.ImportSymbol, strs []mode
 		}
 		clean := strings.TrimLeft(strings.ToLower(imp.Name), "_")
 		if clean == "ptrace" {
-			ev.add("import:" + formatImport(imp))
+			ev.addImport(imp)
 			highSignal = true
 			continue
 		}
 		for _, api := range antiDebugAPIs {
 			if strings.Contains(clean, api) {
-				ev.add("import:" + formatImport(imp))
+				ev.addImport(imp)
 				if api != "outputdebugstring" {
 					highSignal = true
 				}
@@ -614,7 +640,7 @@ func detectPersistence(imports []model.ImportSymbol, strs []model.ExtractedStrin
 		low := strings.ToLower(imp.Name)
 		for _, api := range persistAPIs {
 			if strings.Contains(low, api) {
-				ev.add("import:" + formatImport(imp))
+				ev.addImport(imp)
 				break
 			}
 		}
@@ -663,12 +689,12 @@ func detectPrivilege(fnNames []string, imports []model.ImportSymbol, strs []mode
 		}
 		clean := strings.TrimLeft(strings.ToLower(imp.Name), "_")
 		if exactPriv[clean] {
-			ev.add("import:" + formatImport(imp))
+			ev.addImport(imp)
 			continue
 		}
 		for _, api := range privAPIs {
 			if strings.Contains(clean, api) {
-				ev.add("import:" + formatImport(imp))
+				ev.addImport(imp)
 				break
 			}
 		}
@@ -730,7 +756,7 @@ func detectCrypto(fnNames []string, imports []model.ImportSymbol, crypto []model
 		low := strings.ToLower(imp.Name)
 		for _, api := range cryptoAPIs {
 			if strings.Contains(low, api) {
-				ev.add("import:" + formatImport(imp))
+				ev.addImport(imp)
 				break
 			}
 		}
@@ -753,7 +779,7 @@ func detectSecrets(strs []model.ExtractedString) *Finding {
 	ev := newEvidenceSet()
 	for _, st := range strs {
 		if st.Kind == model.StringSecretCandidate {
-			ev.add(fmt.Sprintf("0x%x: %s", st.Addr, truncate(st.Value, 64)))
+			ev.addKey(st.Value, fmt.Sprintf("0x%x: %s", st.Addr, truncate(st.Value, 64)))
 		}
 	}
 	if ev.len() == 0 {
@@ -783,8 +809,11 @@ func detectObfuscation(res *model.AnalysisResult) ObfuscationReport {
 			rep.UPXDetected = true
 			rep.PackedLikely = true
 		}
-		if s.Entropy >= 7.0 && s.FileSize >= 512 {
-			rep.HighEntropySections = append(rep.HighEntropySections, s)
+		ent := clampEntropy(s.Entropy)
+		if ent >= 7.0 && s.FileSize >= 512 {
+			secCopy := s
+			secCopy.Entropy = ent
+			rep.HighEntropySections = append(rep.HighEntropySections, secCopy)
 		}
 	}
 	// Only treat an embedded "UPX!" string as a UPX signature when the loader already flagged header packing
@@ -823,6 +852,7 @@ func detectObfuscation(res *model.AnalysisResult) ObfuscationReport {
 	var userOrDepFns []model.Function
 	garbledFnCount := 0
 	garbledFnSamples := make([]string, 0, 4)
+	seenFnSamples := make(map[string]struct{}, 4)
 	strippedSourceCount := 0
 	hasMainMain := false
 
@@ -835,7 +865,10 @@ func detectObfuscation(res *model.AnalysisResult) ObfuscationReport {
 			if isGarbleIdentifier(fn.Package) || isGarbleFuncName(fn.Name) {
 				garbledFnCount++
 				if len(garbledFnSamples) < 4 {
-					garbledFnSamples = append(garbledFnSamples, fn.Name)
+					if _, dup := seenFnSamples[fn.Name]; !dup {
+						seenFnSamples[fn.Name] = struct{}{}
+						garbledFnSamples = append(garbledFnSamples, fn.Name)
+					}
 				}
 			}
 			if fn.SourceFile == "" || isGarbleSourceFile(fn.SourceFile) {
@@ -846,6 +879,7 @@ func detectObfuscation(res *model.AnalysisResult) ObfuscationReport {
 
 	garbledPkgCount := 0
 	garbledPkgSamples := make([]string, 0, 4)
+	seenPkgSamples := make(map[string]struct{}, 4)
 	nonStdPkgCount := 0
 	for _, p := range res.Packages {
 		if p.Category == model.CategoryUser || p.Category == model.CategoryDependency {
@@ -853,7 +887,10 @@ func detectObfuscation(res *model.AnalysisResult) ObfuscationReport {
 			if isGarbleIdentifier(p.Name) {
 				garbledPkgCount++
 				if len(garbledPkgSamples) < 4 {
-					garbledPkgSamples = append(garbledPkgSamples, p.Name)
+					if _, dup := seenPkgSamples[p.Name]; !dup {
+						seenPkgSamples[p.Name] = struct{}{}
+						garbledPkgSamples = append(garbledPkgSamples, p.Name)
+					}
 				}
 			}
 		}
@@ -889,6 +926,16 @@ func detectObfuscation(res *model.AnalysisResult) ObfuscationReport {
 		signals = append(signals, "main.main symbol absent or renamed in Go pclntab")
 	}
 
+	// Guard against false positives on normal Go binaries whose BuildInfo/file paths were
+	// stripped without garble symbol obfuscation: when recovered user/dep symbols are all
+	// human-readable (zero garbled identifiers), cap at low confidence (< 50).
+	if len(userOrDepFns) >= 3 && garbledFnCount == 0 && garbledPkgCount == 0 && score > 45 {
+		score = 45
+	}
+
+	if score < 0 {
+		score = 0
+	}
 	if score > 100 {
 		score = 100
 	}
@@ -971,31 +1018,42 @@ func isGarbleToken(tok string) bool {
 		return false
 	}
 	var upper, lower, digits, underscores, vowels, caseSwitches int
-	prevCase := 0 // 1=lower, 2=upper, 3=digit/other
+	var curLowerRun, maxLowerRun, digitRuns int
+	prevCase := 0 // 1=lower, 2=upper, 3=digit, 4=underscore
 	for i, r := range tok {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
 			return false
 		}
-		curCase := 3
+		curCase := 4
 		switch {
 		case r >= 'a' && r <= 'z':
 			lower++
+			curLowerRun++
+			if curLowerRun > maxLowerRun {
+				maxLowerRun = curLowerRun
+			}
 			curCase = 1
 			if isVowel(r) {
 				vowels++
 			}
 		case r >= 'A' && r <= 'Z':
 			upper++
+			curLowerRun = 0
 			curCase = 2
 			if isVowel(unicode.ToLower(r)) {
 				vowels++
 			}
 		case r >= '0' && r <= '9':
 			digits++
+			curLowerRun = 0
 			curCase = 3
+			if prevCase != 3 {
+				digitRuns++
+			}
 		case r == '_':
 			underscores++
-			curCase = 3
+			curLowerRun = 0
+			curCase = 4
 		}
 		if i > 0 && curCase != prevCase {
 			caseSwitches++
@@ -1003,21 +1061,28 @@ func isGarbleToken(tok string) bool {
 		prevCase = curCase
 	}
 
-	// Normal Go identifiers almost never mix uppercase, lowercase, AND multiple interspersed digits with rapid case switching.
-	if upper > 0 && lower > 0 && digits >= 2 && caseSwitches >= 4 {
+	// Readable CamelCase words almost always contain runs of 4+ lowercase letters (e.g. "Verify", "Decode", "Client").
+	if maxLowerRun >= 4 {
+		return false
+	}
+
+	switchDensity := float64(caseSwitches) / float64(len(tok)-1)
+
+	// Randomized garble tokens mix uppercase, lowercase, and interspersed digits with high transition density.
+	if upper > 0 && lower > 0 && digits >= 2 && caseSwitches >= 4 && (digitRuns >= 2 || switchDensity >= 0.60) && switchDensity >= 0.50 {
 		return true
 	}
-	// Base64-like mixed-case token with very high character entropy & high case-switch density & low vowels.
+	// Base64-like mixed-case token with high character entropy, high transition density, and low vowels.
 	ent := tokenEntropy(tok)
 	letters := upper + lower
 	if letters >= 6 && upper >= 2 && lower >= 2 && caseSwitches >= 4 && ent >= 2.9 {
 		vowelRatio := float64(vowels) / float64(letters)
-		if vowelRatio <= 0.25 || digits >= 1 {
+		if (digits >= 1 && switchDensity >= 0.55) || (vowelRatio <= 0.20 && switchDensity >= 0.55) {
 			return true
 		}
 	}
 	// Purely consonant/digit random hash with underscores
-	if len(tok) >= 8 && digits >= 2 && vowels == 0 && (upper+lower) >= 4 && underscores <= 2 {
+	if len(tok) >= 8 && digits >= 2 && digitRuns >= 2 && vowels == 0 && (upper+lower) >= 4 && underscores <= 2 {
 		return true
 	}
 	return false
@@ -1071,11 +1136,22 @@ func formatImport(imp model.ImportSymbol) string {
 	return imp.Library
 }
 
+func clampEntropy(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	if v > 8.0 {
+		return 8.0
+	}
+	return math.Round(v*1000) / 1000
+}
+
 func truncate(s string, maxLen int) string {
 	s = strings.ReplaceAll(s, "\n", "\\n")
 	s = strings.ReplaceAll(s, "\r", "\\r")
-	if len(s) > maxLen && maxLen > 3 {
-		return s[:maxLen-3] + "..."
+	runes := []rune(s)
+	if len(runes) > maxLen && maxLen > 3 {
+		return string(runes[:maxLen-3]) + "..."
 	}
 	return s
 }
@@ -1104,14 +1180,27 @@ func newEvidenceSet() *evidenceSet {
 }
 
 func (e *evidenceSet) add(v string) {
-	if v == "" {
+	e.addKey(v, v)
+}
+
+func (e *evidenceSet) addKey(key, display string) {
+	if key == "" || display == "" {
 		return
 	}
-	if _, ok := e.seen[v]; ok {
+	if _, ok := e.seen[key]; ok {
 		return
 	}
-	e.seen[v] = struct{}{}
-	e.vals = append(e.vals, v)
+	e.seen[key] = struct{}{}
+	e.vals = append(e.vals, display)
+}
+
+func (e *evidenceSet) addImport(imp model.ImportSymbol) {
+	disp := formatImport(imp)
+	if disp == "" {
+		return
+	}
+	key := "import:" + strings.ToLower(imp.Library) + "!" + strings.ToLower(imp.Name)
+	e.addKey(key, "import:"+disp)
 }
 
 func (e *evidenceSet) len() int {

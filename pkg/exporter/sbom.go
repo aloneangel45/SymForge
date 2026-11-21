@@ -126,7 +126,7 @@ func ExportCycloneDX(res *model.AnalysisResult) ([]byte, error) {
 		Metadata: cdxMetadata{
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Tools: []cdxTool{
-				{Vendor: "SymForge", Name: "symforge", Version: "1.0.1"},
+				{Vendor: "SymForge", Name: "symforge", Version: "1.1.1"},
 			},
 			Component: cdxComponent{
 				Type:       "application",

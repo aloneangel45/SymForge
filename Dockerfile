@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG VERSION=1.0.0
+ARG VERSION=1.1.1
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o /out/symforge ./cmd/symforge
 
 FROM gcr.io/distroless/static-debian12:nonroot

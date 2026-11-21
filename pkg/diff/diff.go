@@ -152,55 +152,55 @@ func Compare(binA, binB *model.AnalysisResult, opts Options) (*DiffResult, error
 		},
 	}
 
-	// 1. Diff functions matched by canonical recovered/demangled name.
-	mapA := indexFunctions(binA.Functions, opts.UserOnly)
-	mapB := indexFunctions(binB.Functions, opts.UserOnly)
-	out.Summary.FunctionsA = len(mapA)
-	out.Summary.FunctionsB = len(mapB)
+	// 1. Diff functions matched deterministically by canonical recovered/demangled name
+	// (handling duplicate names such as Go init/closures, Rust monomorphizations, or stripped symbols).
+	groupsA, countA := indexFunctionGroups(binA.Functions, opts.UserOnly)
+	groupsB, countB := indexFunctionGroups(binB.Functions, opts.UserOnly)
+	out.Summary.FunctionsA = countA
+	out.Summary.FunctionsB = countB
 
-	var addedFns []FuncSummary
-	var removedFns []FuncSummary
-	var modifiedFns []ModifiedFunc
+	addedFns := make([]FuncSummary, 0)
+	removedFns := make([]FuncSummary, 0)
+	modifiedFns := make([]ModifiedFunc, 0)
 	unchanged := 0
 
-	for key, fnB := range mapB {
-		fnA, exists := mapA[key]
-		if !exists {
-			addedFns = append(addedFns, toFuncSummary(fnB))
-			continue
-		}
-		var reasons []string
-		sizeDelta := int64(fnB.Size) - int64(fnA.Size)
-		if sizeDelta != 0 {
-			reasons = append(reasons, "size_changed")
-		}
-		if fnA.Category != fnB.Category {
-			reasons = append(reasons, "category_changed")
-		}
-		if !stringSlicesEqualFold(fnA.CryptoRefs, fnB.CryptoRefs) {
-			reasons = append(reasons, "crypto_refs_changed")
-		}
-		if len(reasons) > 0 {
-			modifiedFns = append(modifiedFns, ModifiedFunc{
-				Name:        fnB.Name,
-				Demangled:   fnB.Demangled,
-				Package:     fnB.Package,
-				OldCategory: fnA.Category,
-				NewCategory: fnB.Category,
-				OldEntry:    fnA.Entry,
-				NewEntry:    fnB.Entry,
-				OldSize:     fnA.Size,
-				NewSize:     fnB.Size,
-				SizeDelta:   sizeDelta,
-				Reasons:     reasons,
-			})
-		} else {
-			unchanged++
-		}
+	allKeysMap := make(map[string]struct{}, len(groupsA)+len(groupsB))
+	for k := range groupsA {
+		allKeysMap[k] = struct{}{}
 	}
-	for key, fnA := range mapA {
-		if _, exists := mapB[key]; !exists {
-			removedFns = append(removedFns, toFuncSummary(fnA))
+	for k := range groupsB {
+		allKeysMap[k] = struct{}{}
+	}
+	allKeys := make([]string, 0, len(allKeysMap))
+	for k := range allKeysMap {
+		allKeys = append(allKeys, k)
+	}
+	sort.Strings(allKeys)
+
+	for _, key := range allKeys {
+		listA := groupsA[key]
+		listB := groupsB[key]
+		switch {
+		case len(listA) == 0:
+			for _, fnB := range listB {
+				addedFns = append(addedFns, toFuncSummary(fnB))
+			}
+		case len(listB) == 0:
+			for _, fnA := range listA {
+				removedFns = append(removedFns, toFuncSummary(fnA))
+			}
+		case len(listA) == 1 && len(listB) == 1:
+			if mod, changed := compareFunctionPair(listA[0], listB[0]); changed {
+				modifiedFns = append(modifiedFns, mod)
+			} else {
+				unchanged++
+			}
+		default:
+			aAdd, aRem, aMod, aUnch := diffFunctionGroup(listA, listB)
+			addedFns = append(addedFns, aAdd...)
+			removedFns = append(removedFns, aRem...)
+			modifiedFns = append(modifiedFns, aMod...)
+			unchanged += aUnch
 		}
 	}
 
@@ -212,7 +212,13 @@ func Compare(binA, binB *model.AnalysisResult, opts Options) (*DiffResult, error
 		if ai != aj {
 			return ai > aj
 		}
-		return modifiedFns[i].Name < modifiedFns[j].Name
+		if modifiedFns[i].Name != modifiedFns[j].Name {
+			return modifiedFns[i].Name < modifiedFns[j].Name
+		}
+		if modifiedFns[i].NewEntry != modifiedFns[j].NewEntry {
+			return modifiedFns[i].NewEntry < modifiedFns[j].NewEntry
+		}
+		return modifiedFns[i].OldEntry < modifiedFns[j].OldEntry
 	})
 
 	out.Summary.AddedFunctions = len(addedFns)
@@ -357,7 +363,7 @@ func Compare(binA, binB *model.AnalysisResult, opts Options) (*DiffResult, error
 		Removed: capSlice(removedCrypto, limit),
 	}
 
-	out.Identical = (binA.Binary.SHA256 != "" && binA.Binary.SHA256 == binB.Binary.SHA256) ||
+	out.Identical = (binA.Binary.SHA256 != "" && binA.Binary.SHA256 == binB.Binary.SHA256 && binA.Binary.Arch == binB.Binary.Arch) ||
 		(out.Summary.AddedFunctions == 0 &&
 			out.Summary.RemovedFunctions == 0 &&
 			out.Summary.ModifiedFunctions == 0 &&
@@ -400,26 +406,40 @@ func computeRiskHighlights(
 		})
 	}
 
-	sensitiveAPIs := []string{
+	sensitiveSubstrAPIs := []string{
 		"virtualalloc", "writeprocessmemory", "createremotethread", "ntcreatethreadex",
-		"createprocess", "winexec", "shellexecute", "ptrace", "isdebuggerpresent",
+		"createprocess", "winexec", "shellexecute", "isdebuggerpresent",
 		"checkremotedebuggerpresent", "winhttpopen", "internetopen", "regsetvalue",
-		"createservice", "adjusttokenprivileges", "mprotect", "system", "popen",
+		"createservice", "adjusttokenprivileges",
+	}
+	sensitiveExactAPIs := map[string]bool{
+		"system": true, "popen": true, "wpopen": true, "ptrace": true, "mprotect": true,
 	}
 	var addedSensitive []string
+	seenSensitive := make(map[string]struct{})
 	for _, imp := range addedImps {
-		low := strings.ToLower(imp.Name)
-		if low == "" {
+		clean := strings.TrimLeft(strings.ToLower(imp.Name), "_")
+		if clean == "" {
 			continue
 		}
-		for _, api := range sensitiveAPIs {
-			if strings.Contains(low, api) {
-				label := imp.Name
-				if imp.Library != "" {
-					label = imp.Library + "!" + imp.Name
+		matched := sensitiveExactAPIs[clean]
+		if !matched {
+			for _, api := range sensitiveSubstrAPIs {
+				if strings.Contains(clean, api) {
+					matched = true
+					break
 				}
+			}
+		}
+		if matched {
+			label := imp.Name
+			if imp.Library != "" {
+				label = imp.Library + "!" + imp.Name
+			}
+			key := strings.ToLower(label)
+			if _, dup := seenSensitive[key]; !dup {
+				seenSensitive[key] = struct{}{}
 				addedSensitive = append(addedSensitive, label)
-				break
 			}
 		}
 	}
@@ -524,8 +544,9 @@ func computeRiskHighlights(
 	return highlights
 }
 
-func indexFunctions(funcs []model.Function, userOnly bool) map[string]model.Function {
-	m := make(map[string]model.Function, len(funcs))
+func indexFunctionGroups(funcs []model.Function, userOnly bool) (map[string][]model.Function, int) {
+	groups := make(map[string][]model.Function, len(funcs))
+	total := 0
 	for _, fn := range funcs {
 		if userOnly && fn.Category != model.CategoryUser && fn.Category != model.CategoryDependency {
 			continue
@@ -534,11 +555,152 @@ func indexFunctions(funcs []model.Function, userOnly bool) map[string]model.Func
 		if key == "" {
 			continue
 		}
-		if prev, exists := m[key]; !exists || fn.Size > prev.Size {
-			m[key] = fn
+		groups[key] = append(groups[key], fn)
+		total++
+	}
+	for k := range groups {
+		g := groups[k]
+		if len(g) > 1 {
+			sort.Slice(g, func(i, j int) bool {
+				if g[i].Entry != g[j].Entry {
+					return g[i].Entry < g[j].Entry
+				}
+				if g[i].Size != g[j].Size {
+					return g[i].Size < g[j].Size
+				}
+				if g[i].SourceFile != g[j].SourceFile {
+					return g[i].SourceFile < g[j].SourceFile
+				}
+				if g[i].Line != g[j].Line {
+					return g[i].Line < g[j].Line
+				}
+				return g[i].Name < g[j].Name
+			})
 		}
 	}
-	return m
+	return groups, total
+}
+
+func compareFunctionPair(fnA, fnB model.Function) (ModifiedFunc, bool) {
+	var reasons []string
+	sizeDelta := int64(fnB.Size) - int64(fnA.Size)
+	if sizeDelta != 0 {
+		reasons = append(reasons, "size_changed")
+	}
+	if fnA.Category != fnB.Category {
+		reasons = append(reasons, "category_changed")
+	}
+	if !stringSlicesEqualFold(fnA.CryptoRefs, fnB.CryptoRefs) {
+		reasons = append(reasons, "crypto_refs_changed")
+	}
+	if len(reasons) == 0 {
+		return ModifiedFunc{}, false
+	}
+	return ModifiedFunc{
+		Name:        fnB.Name,
+		Demangled:   fnB.Demangled,
+		Package:     fnB.Package,
+		OldCategory: fnA.Category,
+		NewCategory: fnB.Category,
+		OldEntry:    fnA.Entry,
+		NewEntry:    fnB.Entry,
+		OldSize:     fnA.Size,
+		NewSize:     fnB.Size,
+		SizeDelta:   sizeDelta,
+		Reasons:     reasons,
+	}, true
+}
+
+func diffFunctionGroup(listA, listB []model.Function) (added []FuncSummary, removed []FuncSummary, modified []ModifiedFunc, unchanged int) {
+	usedA := make([]bool, len(listA))
+	usedB := make([]bool, len(listB))
+
+	// Pass 1: exact unchanged matches (preferring same SourceFile+Line, then Entry order).
+	for bi, fnB := range listB {
+		bestA := -1
+		for ai, fnA := range listA {
+			if usedA[ai] {
+				continue
+			}
+			if _, changed := compareFunctionPair(fnA, fnB); !changed {
+				if bestA == -1 {
+					bestA = ai
+				}
+				if fnA.SourceFile != "" && fnA.SourceFile == fnB.SourceFile && fnA.Line == fnB.Line {
+					bestA = ai
+					break
+				}
+			}
+		}
+		if bestA >= 0 {
+			usedA[bestA] = true
+			usedB[bi] = true
+			unchanged++
+		}
+	}
+
+	// Pass 2: match remaining functions by identical non-empty (SourceFile, Line).
+	for bi, fnB := range listB {
+		if usedB[bi] || fnB.SourceFile == "" {
+			continue
+		}
+		for ai, fnA := range listA {
+			if usedA[ai] {
+				continue
+			}
+			if fnA.SourceFile == fnB.SourceFile && fnA.Line == fnB.Line {
+				usedA[ai] = true
+				usedB[bi] = true
+				if mod, changed := compareFunctionPair(fnA, fnB); changed {
+					modified = append(modified, mod)
+				} else {
+					unchanged++
+				}
+				break
+			}
+		}
+	}
+
+	// Pass 3: pair remaining unmatched functions deterministically by smallest size delta (breaking ties by Entry).
+	for bi, fnB := range listB {
+		if usedB[bi] {
+			continue
+		}
+		bestA := -1
+		var bestDelta int64
+		for ai, fnA := range listA {
+			if usedA[ai] {
+				continue
+			}
+			d := absInt64(int64(fnB.Size) - int64(fnA.Size))
+			if bestA == -1 || d < bestDelta {
+				bestA = ai
+				bestDelta = d
+			}
+		}
+		if bestA >= 0 {
+			usedA[bestA] = true
+			usedB[bi] = true
+			if mod, changed := compareFunctionPair(listA[bestA], fnB); changed {
+				modified = append(modified, mod)
+			} else {
+				unchanged++
+			}
+		}
+	}
+
+	// Pass 4: unmatched leftovers become Added or Removed.
+	for bi, fnB := range listB {
+		if !usedB[bi] {
+			added = append(added, toFuncSummary(fnB))
+		}
+	}
+	for ai, fnA := range listA {
+		if !usedA[ai] {
+			removed = append(removed, toFuncSummary(fnA))
+		}
+	}
+	return added, removed, modified, unchanged
 }
 
 func canonicalFuncName(fn model.Function) string {
@@ -630,12 +792,20 @@ func sortFuncSummaries(list []FuncSummary) {
 		if list[i].Size != list[j].Size {
 			return list[i].Size > list[j].Size
 		}
-		return list[i].Name < list[j].Name
+		if list[i].Name != list[j].Name {
+			return list[i].Name < list[j].Name
+		}
+		return list[i].Entry < list[j].Entry
 	})
 }
 
 func sortImports(list []model.ImportSymbol) {
 	sort.Slice(list, func(i, j int) bool {
+		li := strings.ToLower(list[i].Library)
+		lj := strings.ToLower(list[j].Library)
+		if li != lj {
+			return li < lj
+		}
 		if list[i].Library != list[j].Library {
 			return list[i].Library < list[j].Library
 		}
@@ -659,12 +829,16 @@ func stringSlicesEqualFold(a, b []string) bool {
 	if len(a) == 0 {
 		return true
 	}
-	ca := append([]string(nil), a...)
-	cb := append([]string(nil), b...)
+	ca := make([]string, len(a))
+	cb := make([]string, len(b))
+	for i := range a {
+		ca[i] = strings.ToLower(a[i])
+		cb[i] = strings.ToLower(b[i])
+	}
 	sort.Strings(ca)
 	sort.Strings(cb)
 	for i := range ca {
-		if !strings.EqualFold(ca[i], cb[i]) {
+		if ca[i] != cb[i] {
 			return false
 		}
 	}
@@ -688,8 +862,9 @@ func absInt64(v int64) int64 {
 func truncateStr(s string, maxLen int) string {
 	s = strings.ReplaceAll(s, "\n", "\\n")
 	s = strings.ReplaceAll(s, "\r", "\\r")
-	if len(s) > maxLen && maxLen > 3 {
-		return s[:maxLen-3] + "..."
+	runes := []rune(s)
+	if len(runes) > maxLen && maxLen > 3 {
+		return string(runes[:maxLen-3]) + "..."
 	}
 	return s
 }

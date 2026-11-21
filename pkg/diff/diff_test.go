@@ -197,3 +197,84 @@ func main() { fmt.Println(NewWorker(2), "https://v2.symforge.test/api") }
 			foundAdded, foundRemoved, dr.AddedFunctions, dr.RemovedFunctions)
 	}
 }
+
+func TestCompareDuplicateFunctionNamesAndEdgeCases(t *testing.T) {
+	// 1. Duplicate function names (Go init / Rust closures / stripped symbols) must NOT overwrite each other
+	binA := &model.AnalysisResult{
+		Binary: model.BinaryInfo{Path: "a", SHA256: "1111", Arch: model.ArchX86_64},
+		Functions: []model.Function{
+			{Name: "main.init", Package: "main", Category: model.CategoryUser, Entry: 0x1000, Size: 100, SourceFile: "a.go", Line: 10},
+			{Name: "main.init", Package: "main", Category: model.CategoryUser, Entry: 0x1100, Size: 200, SourceFile: "b.go", Line: 20},
+			{Name: "_RNvCs_worker_c1", Demangled: "crate::worker::{{closure}}", Package: "crate", Category: model.CategoryUser, Entry: 0x2000, Size: 80},
+			{Name: "_RNvCs_worker_c2", Demangled: "crate::worker::{{closure}}", Package: "crate", Category: model.CategoryUser, Entry: 0x2100, Size: 120, CryptoRefs: []string{"aes", "SHA-256"}},
+		},
+	}
+	binB := &model.AnalysisResult{
+		Binary: model.BinaryInfo{Path: "b", SHA256: "2222", Arch: model.ArchX86_64},
+		Functions: []model.Function{
+			{Name: "main.init", Package: "main", Category: model.CategoryUser, Entry: 0x1000, Size: 100, SourceFile: "a.go", Line: 10},
+			{Name: "main.init", Package: "main", Category: model.CategoryUser, Entry: 0x1100, Size: 200, SourceFile: "b.go", Line: 20},
+			{Name: "main.init", Package: "main", Category: model.CategoryUser, Entry: 0x1300, Size: 150, SourceFile: "c.go", Line: 30},
+			{Name: "_RNvCs_worker_c1", Demangled: "crate::worker::{{closure}}", Package: "crate", Category: model.CategoryUser, Entry: 0x2000, Size: 80},
+			{Name: "_RNvCs_worker_c2", Demangled: "crate::worker::{{closure}}", Package: "crate", Category: model.CategoryUser, Entry: 0x2200, Size: 180, CryptoRefs: []string{"AES", "sha-256"}},
+		},
+		Imports: []model.ImportSymbol{
+			// Benign Windows API containing "system" must NOT trigger sensitiveAPIs highlight
+			{Library: "KERNEL32.dll", Name: "GetSystemInfo", Address: 0x9000},
+		},
+	}
+
+	dr, err := Compare(binA, binB, Options{UserOnly: true})
+	if err != nil {
+		t.Fatalf("Compare duplicate functions failed: %v", err)
+	}
+	if dr.Summary.FunctionsA != 4 || dr.Summary.FunctionsB != 5 {
+		t.Fatalf("expected FunctionsA=4 FunctionsB=5 (preserving duplicates), got A=%d B=%d", dr.Summary.FunctionsA, dr.Summary.FunctionsB)
+	}
+	if dr.Summary.AddedFunctions != 1 || dr.AddedFunctions[0].Entry != 0x1300 {
+		t.Fatalf("expected 1 added main.init @ 0x1300, got %+v", dr.AddedFunctions)
+	}
+	if dr.Summary.ModifiedFunctions != 1 || dr.ModifiedFunctions[0].SizeDelta != 60 {
+		t.Fatalf("expected 1 modified closure with delta +60, got %+v", dr.ModifiedFunctions)
+	}
+	// Case-insensitive CryptoRefs ["aes","SHA-256"] vs ["AES","sha-256"] must NOT report crypto_refs_changed
+	for _, reason := range dr.ModifiedFunctions[0].Reasons {
+		if reason == "crypto_refs_changed" {
+			t.Fatalf("false positive crypto_refs_changed on case-only difference: %+v", dr.ModifiedFunctions[0].Reasons)
+		}
+	}
+	if dr.Summary.UnchangedFunctions != 3 {
+		t.Fatalf("expected 3 unchanged duplicate functions, got %d", dr.Summary.UnchangedFunctions)
+	}
+	// Verify GetSystemInfo did not trigger sensitive native import highlight
+	for _, h := range dr.RiskHighlights {
+		if strings.Contains(h.Detail, "GetSystemInfo") {
+			t.Fatalf("false positive sensitive API highlight on GetSystemInfo: %+v", h)
+		}
+	}
+
+	// 2. Empty binaries diff cleanly
+	emptyA := &model.AnalysisResult{Binary: model.BinaryInfo{Path: "e1", Arch: model.ArchX86_64}}
+	emptyB := &model.AnalysisResult{Binary: model.BinaryInfo{Path: "e2", Arch: model.ArchX86_64}}
+	emptyDiff, err := Compare(emptyA, emptyB, Options{})
+	if err != nil || !emptyDiff.Identical || emptyDiff.Summary.FunctionsA != 0 {
+		t.Fatalf("unexpected empty diff: err=%v res=%+v", err, emptyDiff)
+	}
+
+	// 3. Same Fat Mach-O SHA256 but different Arch slices with different functions must NOT be Identical
+	fatArm := &model.AnalysisResult{
+		Binary:    model.BinaryInfo{Path: "fat", SHA256: "samehash", Arch: model.ArchARM64},
+		Functions: []model.Function{{Name: "arm_only", Entry: 0x1000, Size: 32, Category: model.CategoryUser}},
+	}
+	fatAmd := &model.AnalysisResult{
+		Binary:    model.BinaryInfo{Path: "fat", SHA256: "samehash", Arch: model.ArchX86_64},
+		Functions: []model.Function{{Name: "amd_only", Entry: 0x2000, Size: 64, Category: model.CategoryUser}},
+	}
+	fatDiff, err := Compare(fatArm, fatAmd, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fatDiff.Identical {
+		t.Fatalf("expected Identical=false when comparing different Arch slices of same Fat Mach-O")
+	}
+}

@@ -38,7 +38,7 @@ type Server struct {
 // New creates a new SymForge MCP server bound to engine.
 func New(version string, engine *analyzer.Engine) *Server {
 	if version == "" {
-		version = "1.1.0"
+		version = "1.1.1"
 	}
 	if engine == nil {
 		engine = analyzer.DefaultEngine

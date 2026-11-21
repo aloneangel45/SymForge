@@ -10,7 +10,10 @@ import (
 )
 
 // DefaultMaxPathDepth bounds BFS call-graph traversal when callers pass <= 0.
-const DefaultMaxPathDepth = 12
+const (
+	DefaultMaxPathDepth = 12
+	MaxPathDepth        = 128
+)
 
 // PathHop represents one function node along a call-graph shortest path.
 type PathHop struct {
@@ -109,6 +112,9 @@ func FindCallPath(funcs []model.Function, fromQuery, toQuery string, maxDepth in
 	if maxDepth <= 0 {
 		maxDepth = DefaultMaxPathDepth
 	}
+	if maxDepth > MaxPathDepth {
+		maxDepth = MaxPathDepth
+	}
 	fromFn, err := ResolveFunction(funcs, fromQuery)
 	if err != nil {
 		return nil, fmt.Errorf("resolve --from %q: %w", fromQuery, err)
@@ -129,6 +135,20 @@ func FindCallPath(funcs []model.Function, fromQuery, toQuery string, maxDepth in
 		From:     makePathHop(fromFn, 0),
 		To:       makePathHop(toFn, 0),
 		MaxDepth: maxDepth,
+	}
+
+	if fromFn.Entry == 0 || toFn.Entry == 0 {
+		if fromFn.Entry == 0 && toFn.Entry == 0 && fromFn.Name == toFn.Name && fromFn.Demangled == toFn.Demangled {
+			res.Found = true
+			res.Hops = 0
+			res.NodesVisited = 1
+			res.Path = []PathHop{makePathHop(fromFn, 0)}
+			return res, nil
+		}
+		res.Found = false
+		res.Message = fmt.Sprintf("cannot trace call path when function has zero entry address (from=%s 0x%x, to=%s 0x%x)",
+			displayFuncName(fromFn), fromFn.Entry, displayFuncName(toFn), toFn.Entry)
+		return res, nil
 	}
 
 	if fromFn.Entry == toFn.Entry {
@@ -187,9 +207,9 @@ func FindCallPath(funcs []model.Function, fromQuery, toQuery string, maxDepth in
 		return res, nil
 	}
 
-	// Reconstruct chain from target back to source.
+	// Reconstruct chain from target back to source (bounded by len(visited) for guaranteed termination).
 	var chain []uint64
-	for cur := toFn.Entry; ; {
+	for cur := toFn.Entry; len(chain) <= len(visited); {
 		chain = append(chain, cur)
 		if cur == fromFn.Entry {
 			break
